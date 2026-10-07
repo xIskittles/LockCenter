@@ -1,10 +1,8 @@
 package com.anton.lockcenter;
 
 import android.content.Context;
+import android.content.res.Resources;
 import android.view.View;
-import android.view.ViewGroup;
-import androidx.constraintlayout.widget.ConstraintLayout;
-import androidx.constraintlayout.widget.ConstraintSet;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -14,6 +12,13 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class MainHook implements IXposedHookLoadPackage {
     private static final String TAG = "[LockCenter] ";
+
+    // Константы ConstraintSet из AndroidX (чтобы не тянуть библиотеку)
+    private static final int PARENT_ID = 0;
+    private static final int START = 6;
+    private static final int END = 7;
+    private static final int TOP = 3;
+    private static final int BOTTOM = 4;
 
     private static void log(String msg) {
         XposedBridge.log(TAG + msg);
@@ -25,10 +30,10 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        log("Инициализация центрирования Lockscreen для Android 16...");
+        log("Запуск центрирования на Android 16 (через рефлексию)...");
         ClassLoader cl = lpparam.classLoader;
 
-        // 1. Хук на применение ConstraintSet к KeyguardRootView (главный движок разметки)
+        // 1. Хук на применение ConstraintSet к KeyguardRootView
         try {
             Class<?> constraintSetClass = XposedHelpers.findClassIfExists(
                 "androidx.constraintlayout.widget.ConstraintSet", cl);
@@ -42,9 +47,9 @@ public class MainHook implements IXposedHookLoadPackage {
                         if (param.args.length > 0 && param.args[0] != null &&
                             keyguardRootViewClass.isInstance(param.args[0])) {
                             
-                            ConstraintSet cs = (ConstraintSet) param.thisObject;
-                            ConstraintLayout root = (ConstraintLayout) param.args[0];
-                            applyCenterConstraints(cs, root);
+                            Object constraintSet = param.thisObject;
+                            View rootView = (View) param.args[0];
+                            modifyConstraints(constraintSet, rootView);
                         }
                     }
                 });
@@ -54,26 +59,25 @@ public class MainHook implements IXposedHookLoadPackage {
             log("Ошибка хука ConstraintSet: " + t);
         }
 
-        // 2. Дополнительный хук на изменение положения самих View (FlexClock и иконки)
+        // 2. Хук на изменение положения View (часы, дата, иконки) для надежности
         try {
             Class<?> viewClass = XposedHelpers.findClass("android.view.View", cl);
             XposedBridge.hookAllMethods(viewClass, "onSizeChanged", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     View v = (View) param.thisObject;
-                    enforceCenterTranslation(v);
+                    alignCenter(v);
                 }
             });
         } catch (Throwable t) {
-            log("Ошибка хука onSizeChanged: " + t);
+            log("Ошибка хука View: " + t);
         }
     }
 
-    private static void applyCenterConstraints(ConstraintSet cs, ConstraintLayout root) {
+    private static void modifyConstraints(Object cs, View root) {
         Context context = root.getContext();
-        int parentId = ConstraintSet.PARENT_ID;
+        Resources res = context.getResources();
 
-        // Идентификаторы элементов на экране блокировки Pixel Android 15/16
         String[] targetIds = {
             "lockscreen_clock_view",
             "small_clock_view",
@@ -85,31 +89,32 @@ public class MainHook implements IXposedHookLoadPackage {
         };
 
         for (String idName : targetIds) {
-            int id = context.getResources().getIdentifier(idName, "id", "com.android.systemui");
+            int id = res.getIdentifier(idName, "id", "com.android.systemui");
             if (id > 0) {
                 try {
-                    // Центрируем элемент по горизонтали между краями экрана
-                    cs.connect(id, ConstraintSet.START, parentId, ConstraintSet.START);
-                    cs.connect(id, ConstraintSet.END, parentId, ConstraintSet.END);
-                    cs.setHorizontalBias(id, 0.5f);
+                    // connect(int startID, int startSide, int endID, int endSide)
+                    XposedHelpers.callMethod(cs, "connect", id, START, PARENT_ID, START);
+                    XposedHelpers.callMethod(cs, "connect", id, END, PARENT_ID, END);
+                    // setHorizontalBias(int targetID, float bias) -> 0.5f = ровно центр
+                    XposedHelpers.callMethod(cs, "setHorizontalBias", id, 0.5f);
                 } catch (Throwable ignored) {}
             }
         }
 
-        // Если есть виджет даты (smartspace), отвязываем его от правого края часов и ставим СТРОГО ПОД ЧАСАМИ
-        int clockId = context.getResources().getIdentifier("lockscreen_clock_view", "id", "com.android.systemui");
-        int smartspaceId = context.getResources().getIdentifier("bc_smartspace_view", "id", "com.android.systemui");
+        // Ставим дату (smartspace) строго под часы
+        int clockId = res.getIdentifier("lockscreen_clock_view", "id", "com.android.systemui");
+        int smartspaceId = res.getIdentifier("bc_smartspace_view", "id", "com.android.systemui");
         if (clockId > 0 && smartspaceId > 0) {
             try {
-                cs.connect(smartspaceId, ConstraintSet.TOP, clockId, ConstraintSet.BOTTOM);
-                cs.connect(smartspaceId, ConstraintSet.START, parentId, ConstraintSet.START);
-                cs.connect(smartspaceId, ConstraintSet.END, parentId, ConstraintSet.END);
-                cs.setHorizontalBias(smartspaceId, 0.5f);
+                XposedHelpers.callMethod(cs, "connect", smartspaceId, TOP, clockId, BOTTOM);
+                XposedHelpers.callMethod(cs, "connect", smartspaceId, START, PARENT_ID, START);
+                XposedHelpers.callMethod(cs, "connect", smartspaceId, END, PARENT_ID, END);
+                XposedHelpers.callMethod(cs, "setHorizontalBias", smartspaceId, 0.5f);
             } catch (Throwable ignored) {}
         }
     }
 
-    private static void enforceCenterTranslation(View view) {
+    private static void alignCenter(View view) {
         if (view == null || view.getVisibility() != View.VISIBLE) return;
 
         String cls = view.getClass().getName();
@@ -119,7 +124,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
         if (!isClock && !isSmartspace && !isIconShelf) return;
 
-        // Проверяем, что View действительно лежит на экране блокировки
         View parent = (View) view.getParent();
         if (parent == null || !parent.getClass().getName().contains("KeyguardRootView")) {
             return;
@@ -128,7 +132,6 @@ public class MainHook implements IXposedHookLoadPackage {
         int screenWidth = view.getResources().getDisplayMetrics().widthPixels;
         int viewWidth = view.getWidth();
 
-        // Если элемент не на всю ширину (то есть в компактном режиме сбоку)
         if (viewWidth > 0 && viewWidth < screenWidth - 100) {
             view.post(() -> {
                 int currentLeft = view.getLeft();
