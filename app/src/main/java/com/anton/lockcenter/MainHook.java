@@ -1,26 +1,23 @@
 package com.anton.lockcenter;
 
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
+
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-import java.util.concurrent.atomic.AtomicInteger;
-
 public class MainHook implements IXposedHookLoadPackage {
-    private static final String TAG = "[LockCenter-Scout] ";
-    private static final AtomicInteger logCount = new AtomicInteger(0);
-    private static final int MAX_LOGS = 2500;
-    private static long lastDumpTime = 0;
+    private static final String TAG = "[LockCenter] ";
 
     private static void log(String msg) {
-        if (logCount.incrementAndGet() <= MAX_LOGS) {
-            XposedBridge.log(TAG + msg);
-        }
+        XposedBridge.log(TAG + msg);
     }
 
     @Override
@@ -29,88 +26,112 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        log("SystemUI Android 16 hooked! Настройка слежения за KeyguardRootView...");
+        log("Загружен в SystemUI Android 16!");
         ClassLoader cl = lpparam.classLoader;
 
-        // Хукаем непосредственно KeyguardRootView — центр всей разметки на Android 16
+        // 1. Хук на FlexClockViewGroup (часы экрана блокировки Pixel)
         try {
-            Class<?> rootClass = XposedHelpers.findClassIfExists(
-                "com.android.systemui.keyguard.ui.view.KeyguardRootView", cl);
-            if (rootClass != null) {
-                XposedBridge.hookAllMethods(rootClass, "onLayout", new XC_MethodHook() {
+            Class<?> flexClockClass = XposedHelpers.findClassIfExists(
+                "com.android.systemui.shared.clocks.view.FlexClockViewGroup", cl);
+            if (flexClockClass != null) {
+                // Хукаем layout часов
+                XposedBridge.hookAllMethods(flexClockClass, "layout", new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        long now = System.currentTimeMillis();
-                        // Дампим не чаще 1 раза в 2 секунды, чтобы не забивать память
-                        if (now - lastDumpTime > 2000) {
-                            lastDumpTime = now;
-                            View root = (View) param.thisObject;
-                            log(">>> KEYGUARD LAYOUT DUMP (w=" + root.getWidth() + " h=" + root.getHeight() + ") <<<");
-                            dumpSafe(root, 0);
+                        View clockView = (View) param.thisObject;
+                        centerViewHorizontally(clockView);
+                    }
+                });
+            }
+        } catch (Throwable t) {
+            log("Ошибка FlexClockViewGroup: " + t);
+        }
+
+        // 2. Хук на Smartspace (виджет даты/погоды "Самое главное")
+        try {
+            Class<?> smartspaceClass = XposedHelpers.findClassIfExists(
+                "com.google.android.systemui.smartspace.BcSmartspaceView", cl);
+            if (smartspaceClass == null) {
+                smartspaceClass = XposedHelpers.findClassIfExists(
+                    "com.android.systemui.statusbar.policy.VariableDateView", cl);
+            }
+            if (smartspaceClass != null) {
+                XposedBridge.hookAllMethods(smartspaceClass, "layout", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        View dateView = (View) param.thisObject;
+                        centerViewHorizontally(dateView);
+                    }
+                });
+            }
+        } catch (Throwable t) {
+            log("Ошибка Smartspace/Date: " + t);
+        }
+
+        // 3. Хук на NotificationIconContainer (компактная иконка Telegram / уведомлений)
+        try {
+            Class<?> iconContainerClass = XposedHelpers.findClassIfExists(
+                "com.android.systemui.statusbar.phone.NotificationIconContainer", cl);
+            if (iconContainerClass != null) {
+                XposedBridge.hookAllMethods(iconContainerClass, "layout", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        View iconView = (View) param.thisObject;
+                        // Центрируем только если это иконки на Keyguard / AOD, а не в шторке
+                        if (isKeyguardElement(iconView)) {
+                            centerViewHorizontally(iconView);
                         }
                     }
                 });
             }
         } catch (Throwable t) {
-            log("Ошибка хука KeyguardRootView: " + t);
-        }
-
-        // Отслеживание FlexClockViewGroup
-        try {
-            Class<?> flexClockClass = XposedHelpers.findClassIfExists(
-                "com.android.systemui.shared.clocks.view.FlexClockViewGroup", cl);
-            if (flexClockClass != null) {
-                XposedBridge.hookAllMethods(flexClockClass, "onLayout", new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        View v = (View) param.thisObject;
-                        log("FlexClock layout: pos=[" + v.getLeft() + "," + v.getTop() + ".." + v.getRight() + "," + v.getBottom() + "] vis=" + v.getVisibility());
-                    }
-                });
-            }
-        } catch (Throwable t) {
-            log("Ошибка хука FlexClock: " + t);
+            log("Ошибка NotificationIconContainer: " + t);
         }
     }
 
-    private static void dumpSafe(View v, int depth) {
-        if (v == null || logCount.get() >= MAX_LOGS || depth > 8) return;
+    /**
+     * Центрирует любой View относительно экрана, корректируя translationX
+     */
+    private static void centerViewHorizontally(View view) {
+        if (view == null || view.getVisibility() != View.VISIBLE) return;
 
-        String cls = v.getClass().getSimpleName();
-        String idName = getResourceEntryName(v);
-        int vis = v.getVisibility();
-        if (vis != View.VISIBLE) return; // Нас интересуют только видимые элементы
+        View parent = (View) view.getParent();
+        if (parent == null) return;
 
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < depth; i++) sb.append("  ");
-        sb.append(cls).append(" [").append(idName).append("] ")
-          .append("xy=(").append(v.getLeft()).append(",").append(v.getTop()).append(") ")
-          .append("wh=(").append(v.getWidth()).append("x").append(v.getHeight()).append(")");
-
-        if (v instanceof TextView) {
-            CharSequence text = ((TextView) v).getText();
-            if (text != null && text.length() > 0) {
-                sb.append(" text='").append(text).append("'");
-            }
+        int parentWidth = parent.getWidth();
+        if (parentWidth <= 0) {
+            parentWidth = view.getResources().getDisplayMetrics().widthPixels;
         }
-        log(sb.toString());
 
-        if (v instanceof ViewGroup) {
-            ViewGroup vg = (ViewGroup) v;
-            int count = vg.getChildCount();
-            for (int i = 0; i < count; i++) {
-                dumpSafe(vg.getChildAt(i), depth + 1);
-            }
+        int viewWidth = view.getWidth();
+        if (viewWidth <= 0 || viewWidth >= parentWidth - 50) {
+            // Если вьюшка во всю ширину экрана — центрировать не нужно (например, развернутое уведомление)
+            return;
+        }
+
+        int currentLeft = view.getLeft();
+        int targetLeft = (parentWidth - viewWidth) / 2;
+        int deltaX = targetLeft - currentLeft;
+
+        // Применяем сдвиг, чтобы элемент встал строго по центру
+        if (view.getTranslationX() != deltaX) {
+            view.setTranslationX(deltaX);
         }
     }
 
-    private static String getResourceEntryName(View v) {
-        int id = v.getId();
-        if (id == View.NO_ID) return "-";
-        try {
-            return v.getResources().getResourceEntryName(id);
-        } catch (Exception e) {
-            return "0x" + Integer.toHexString(id);
+    private static boolean isKeyguardElement(View view) {
+        View current = view;
+        while (current != null) {
+            String name = current.getClass().getName();
+            if (name.contains("KeyguardRootView") || name.contains("Aod") || name.contains("Keyguard")) {
+                return true;
+            }
+            if (current.getParent() instanceof View) {
+                current = (View) current.getParent();
+            } else {
+                break;
+            }
         }
+        return false;
     }
 }
