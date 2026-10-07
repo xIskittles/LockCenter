@@ -1,118 +1,116 @@
 package com.anton.lockcenter;
 
-import android.os.Handler;
-import android.os.Looper;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
-
-import java.lang.ref.WeakReference;
-import java.util.ArrayList;
-import java.util.List;
-
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/**
- * SCOUT build: moves nothing. Every 3 seconds it checks what is visible
- * inside SystemUI windows and writes the structure to the LSPosed log
- * (only when it changed). No notification text is logged, only text length.
- */
-public class MainHook implements IXposedHookLoadPackage {
+import java.util.concurrent.atomic.AtomicInteger;
 
-    private static final List<WeakReference<View>> ROOTS = new ArrayList<>();
-    private static String last = "";
-    private static int logged = 0;
+public class MainHook implements IXposedHookLoadPackage {
+    private static final String TAG = "[LockCenter-Scout] ";
+    private static final AtomicInteger logCount = new AtomicInteger(0);
+    private static final int MAX_LOGS = 2500;
+    private static long lastDumpTime = 0;
+
+    private static void log(String msg) {
+        if (logCount.incrementAndGet() <= MAX_LOGS) {
+            XposedBridge.log(TAG + msg);
+        }
+    }
 
     @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        if (!"com.android.systemui".equals(lpparam.packageName)) return;
-        XposedBridge.log("[LockCenter] scout started");
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+        if (!"com.android.systemui".equals(lpparam.packageName)) {
+            return;
+        }
 
+        log("SystemUI Android 16 hooked! Настройка слежения за KeyguardRootView...");
+        ClassLoader cl = lpparam.classLoader;
+
+        // Хукаем непосредственно KeyguardRootView — центр всей разметки на Android 16
         try {
-            Class<?> vri = XposedHelpers.findClass("android.view.ViewRootImpl", lpparam.classLoader);
-            XposedBridge.hookAllMethods(vri, "setView", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    if (param.args.length > 0 && param.args[0] instanceof View) {
-                        ROOTS.add(new WeakReference<>((View) param.args[0]));
+            Class<?> rootClass = XposedHelpers.findClassIfExists(
+                "com.android.systemui.keyguard.ui.view.KeyguardRootView", cl);
+            if (rootClass != null) {
+                XposedBridge.hookAllMethods(rootClass, "onLayout", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        long now = System.currentTimeMillis();
+                        // Дампим не чаще 1 раза в 2 секунды, чтобы не забивать память
+                        if (now - lastDumpTime > 2000) {
+                            lastDumpTime = now;
+                            View root = (View) param.thisObject;
+                            log(">>> KEYGUARD LAYOUT DUMP (w=" + root.getWidth() + " h=" + root.getHeight() + ") <<<");
+                            dumpSafe(root, 0);
+                        }
                     }
-                }
-            });
+                });
+            }
         } catch (Throwable t) {
-            XposedBridge.log(t);
+            log("Ошибка хука KeyguardRootView: " + t);
         }
 
-        final Handler handler = new Handler(Looper.getMainLooper());
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                dump();
-                handler.postDelayed(this, 3000);
-            }
-        }, 10000);
-    }
-
-    private static void dump() {
+        // Отслеживание FlexClockViewGroup
         try {
-            if (logged > 4000) return;
-            StringBuilder sb = new StringBuilder();
-            for (WeakReference<View> ref : ROOTS) {
-                View v = ref.get();
-                if (v != null && v.isAttachedToWindow()) {
-                    sb.append("ROOT ").append(v.getClass().getName()).append('\n');
-                    walk(v, 0, sb);
-                }
+            Class<?> flexClockClass = XposedHelpers.findClassIfExists(
+                "com.android.systemui.shared.clocks.view.FlexClockViewGroup", cl);
+            if (flexClockClass != null) {
+                XposedBridge.hookAllMethods(flexClockClass, "onLayout", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        log("FlexClock layout: pos=[" + v.getLeft() + "," + v.getTop() + ".." + v.getRight() + "," + v.getBottom() + "] vis=" + v.getVisibility());
+                    }
+                });
             }
-            String now = sb.toString();
-            if (now.equals(last)) return;
-            last = now;
-            String[] lines = now.split("\n");
-            XposedBridge.log("[LockCenter] ===== DUMP " + System.currentTimeMillis() + " =====");
-            for (String s : lines) {
-                XposedBridge.log("[LockCenter] " + s);
-            }
-            logged += lines.length;
         } catch (Throwable t) {
-            XposedBridge.log(t);
+            log("Ошибка хука FlexClock: " + t);
         }
     }
 
-    private static void walk(View v, int depth, StringBuilder sb) {
-        if (depth > 40 || v.getVisibility() != View.VISIBLE
-                || v.getWidth() == 0 || v.getHeight() == 0) return;
+    private static void dumpSafe(View v, int depth) {
+        if (v == null || logCount.get() >= MAX_LOGS || depth > 8) return;
 
-        String id = "-";
-        try {
-            if (v.getId() != View.NO_ID) {
-                id = v.getResources().getResourceEntryName(v.getId());
-            }
-        } catch (Throwable ignored) {
-        }
+        String cls = v.getClass().getSimpleName();
+        String idName = getResourceEntryName(v);
+        int vis = v.getVisibility();
+        if (vis != View.VISIBLE) return; // Нас интересуют только видимые элементы
 
-        int[] xy = new int[2];
-        v.getLocationOnScreen(xy);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < depth; i++) sb.append("  ");
+        sb.append(cls).append(" [").append(idName).append("] ")
+          .append("xy=(").append(v.getLeft()).append(",").append(v.getTop()).append(") ")
+          .append("wh=(").append(v.getWidth()).append("x").append(v.getHeight()).append(")");
 
-        sb.append(depth).append(' ')
-                .append(v.getClass().getName())
-                .append(" id=").append(id)
-                .append(" x=").append(xy[0])
-                .append(" y=").append(xy[1])
-                .append(" w=").append(v.getWidth())
-                .append(" h=").append(v.getHeight());
         if (v instanceof TextView) {
-            sb.append(" textLen=").append(((TextView) v).getText().length());
+            CharSequence text = ((TextView) v).getText();
+            if (text != null && text.length() > 0) {
+                sb.append(" text='").append(text).append("'");
+            }
         }
-        sb.append('\n');
+        log(sb.toString());
 
         if (v instanceof ViewGroup) {
-            ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); i++) {
-                walk(g.getChildAt(i), depth + 1, sb);
+            ViewGroup vg = (ViewGroup) v;
+            int count = vg.getChildCount();
+            for (int i = 0; i < count; i++) {
+                dumpSafe(vg.getChildAt(i), depth + 1);
             }
+        }
+    }
+
+    private static String getResourceEntryName(View v) {
+        int id = v.getId();
+        if (id == View.NO_ID) return "-";
+        try {
+            return v.getResources().getResourceEntryName(id);
+        } catch (Exception e) {
+            return "0x" + Integer.toHexString(id);
         }
     }
 }
