@@ -1,11 +1,10 @@
 package com.anton.lockcenter;
 
-import android.view.Gravity;
+import android.content.Context;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.FrameLayout;
-import android.widget.LinearLayout;
-import android.widget.TextView;
+import androidx.constraintlayout.widget.ConstraintLayout;
+import androidx.constraintlayout.widget.ConstraintSet;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -26,112 +25,119 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        log("Загружен в SystemUI Android 16!");
+        log("Инициализация центрирования Lockscreen для Android 16...");
         ClassLoader cl = lpparam.classLoader;
 
-        // 1. Хук на FlexClockViewGroup (часы экрана блокировки Pixel)
+        // 1. Хук на применение ConstraintSet к KeyguardRootView (главный движок разметки)
         try {
-            Class<?> flexClockClass = XposedHelpers.findClassIfExists(
-                "com.android.systemui.shared.clocks.view.FlexClockViewGroup", cl);
-            if (flexClockClass != null) {
-                // Хукаем layout часов
-                XposedBridge.hookAllMethods(flexClockClass, "layout", new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        View clockView = (View) param.thisObject;
-                        centerViewHorizontally(clockView);
-                    }
-                });
-            }
-        } catch (Throwable t) {
-            log("Ошибка FlexClockViewGroup: " + t);
-        }
+            Class<?> constraintSetClass = XposedHelpers.findClassIfExists(
+                "androidx.constraintlayout.widget.ConstraintSet", cl);
+            Class<?> keyguardRootViewClass = XposedHelpers.findClassIfExists(
+                "com.android.systemui.keyguard.ui.view.KeyguardRootView", cl);
 
-        // 2. Хук на Smartspace (виджет даты/погоды "Самое главное")
-        try {
-            Class<?> smartspaceClass = XposedHelpers.findClassIfExists(
-                "com.google.android.systemui.smartspace.BcSmartspaceView", cl);
-            if (smartspaceClass == null) {
-                smartspaceClass = XposedHelpers.findClassIfExists(
-                    "com.android.systemui.statusbar.policy.VariableDateView", cl);
-            }
-            if (smartspaceClass != null) {
-                XposedBridge.hookAllMethods(smartspaceClass, "layout", new XC_MethodHook() {
+            if (constraintSetClass != null && keyguardRootViewClass != null) {
+                XposedBridge.hookAllMethods(constraintSetClass, "applyTo", new XC_MethodHook() {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        View dateView = (View) param.thisObject;
-                        centerViewHorizontally(dateView);
-                    }
-                });
-            }
-        } catch (Throwable t) {
-            log("Ошибка Smartspace/Date: " + t);
-        }
-
-        // 3. Хук на NotificationIconContainer (компактная иконка Telegram / уведомлений)
-        try {
-            Class<?> iconContainerClass = XposedHelpers.findClassIfExists(
-                "com.android.systemui.statusbar.phone.NotificationIconContainer", cl);
-            if (iconContainerClass != null) {
-                XposedBridge.hookAllMethods(iconContainerClass, "layout", new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        View iconView = (View) param.thisObject;
-                        // Центрируем только если это иконки на Keyguard / AOD, а не в шторке
-                        if (isKeyguardElement(iconView)) {
-                            centerViewHorizontally(iconView);
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (param.args.length > 0 && param.args[0] != null &&
+                            keyguardRootViewClass.isInstance(param.args[0])) {
+                            
+                            ConstraintSet cs = (ConstraintSet) param.thisObject;
+                            ConstraintLayout root = (ConstraintLayout) param.args[0];
+                            applyCenterConstraints(cs, root);
                         }
                     }
                 });
+                log("Хук ConstraintSet.applyTo успешно установлен!");
             }
         } catch (Throwable t) {
-            log("Ошибка NotificationIconContainer: " + t);
+            log("Ошибка хука ConstraintSet: " + t);
+        }
+
+        // 2. Дополнительный хук на изменение положения самих View (FlexClock и иконки)
+        try {
+            Class<?> viewClass = XposedHelpers.findClass("android.view.View", cl);
+            XposedBridge.hookAllMethods(viewClass, "onSizeChanged", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    View v = (View) param.thisObject;
+                    enforceCenterTranslation(v);
+                }
+            });
+        } catch (Throwable t) {
+            log("Ошибка хука onSizeChanged: " + t);
         }
     }
 
-    /**
-     * Центрирует любой View относительно экрана, корректируя translationX
-     */
-    private static void centerViewHorizontally(View view) {
-        if (view == null || view.getVisibility() != View.VISIBLE) return;
+    private static void applyCenterConstraints(ConstraintSet cs, ConstraintLayout root) {
+        Context context = root.getContext();
+        int parentId = ConstraintSet.PARENT_ID;
 
-        View parent = (View) view.getParent();
-        if (parent == null) return;
+        // Идентификаторы элементов на экране блокировки Pixel Android 15/16
+        String[] targetIds = {
+            "lockscreen_clock_view",
+            "small_clock_view",
+            "bc_smartspace_view",
+            "date_smartspace_view",
+            "weather_smartspace_view",
+            "aod_notification_icon_container",
+            "notification_shelf"
+        };
 
-        int parentWidth = parent.getWidth();
-        if (parentWidth <= 0) {
-            parentWidth = view.getResources().getDisplayMetrics().widthPixels;
+        for (String idName : targetIds) {
+            int id = context.getResources().getIdentifier(idName, "id", "com.android.systemui");
+            if (id > 0) {
+                try {
+                    // Центрируем элемент по горизонтали между краями экрана
+                    cs.connect(id, ConstraintSet.START, parentId, ConstraintSet.START);
+                    cs.connect(id, ConstraintSet.END, parentId, ConstraintSet.END);
+                    cs.setHorizontalBias(id, 0.5f);
+                } catch (Throwable ignored) {}
+            }
         }
 
-        int viewWidth = view.getWidth();
-        if (viewWidth <= 0 || viewWidth >= parentWidth - 50) {
-            // Если вьюшка во всю ширину экрана — центрировать не нужно (например, развернутое уведомление)
+        // Если есть виджет даты (smartspace), отвязываем его от правого края часов и ставим СТРОГО ПОД ЧАСАМИ
+        int clockId = context.getResources().getIdentifier("lockscreen_clock_view", "id", "com.android.systemui");
+        int smartspaceId = context.getResources().getIdentifier("bc_smartspace_view", "id", "com.android.systemui");
+        if (clockId > 0 && smartspaceId > 0) {
+            try {
+                cs.connect(smartspaceId, ConstraintSet.TOP, clockId, ConstraintSet.BOTTOM);
+                cs.connect(smartspaceId, ConstraintSet.START, parentId, ConstraintSet.START);
+                cs.connect(smartspaceId, ConstraintSet.END, parentId, ConstraintSet.END);
+                cs.setHorizontalBias(smartspaceId, 0.5f);
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void enforceCenterTranslation(View view) {
+        if (view == null || view.getVisibility() != View.VISIBLE) return;
+
+        String cls = view.getClass().getName();
+        boolean isClock = cls.contains("FlexClockViewGroup");
+        boolean isSmartspace = cls.contains("BcSmartspaceView");
+        boolean isIconShelf = cls.contains("NotificationIconContainer") || cls.contains("NotificationShelf");
+
+        if (!isClock && !isSmartspace && !isIconShelf) return;
+
+        // Проверяем, что View действительно лежит на экране блокировки
+        View parent = (View) view.getParent();
+        if (parent == null || !parent.getClass().getName().contains("KeyguardRootView")) {
             return;
         }
 
-        int currentLeft = view.getLeft();
-        int targetLeft = (parentWidth - viewWidth) / 2;
-        int deltaX = targetLeft - currentLeft;
+        int screenWidth = view.getResources().getDisplayMetrics().widthPixels;
+        int viewWidth = view.getWidth();
 
-        // Применяем сдвиг, чтобы элемент встал строго по центру
-        if (view.getTranslationX() != deltaX) {
-            view.setTranslationX(deltaX);
+        // Если элемент не на всю ширину (то есть в компактном режиме сбоку)
+        if (viewWidth > 0 && viewWidth < screenWidth - 100) {
+            view.post(() -> {
+                int currentLeft = view.getLeft();
+                int targetLeft = (screenWidth - view.getWidth()) / 2;
+                int deltaX = targetLeft - currentLeft;
+                if (Math.abs(view.getTranslationX() - deltaX) > 2) {
+                    view.setTranslationX(deltaX);
+                }
+            });
         }
-    }
-
-    private static boolean isKeyguardElement(View view) {
-        View current = view;
-        while (current != null) {
-            String name = current.getClass().getName();
-            if (name.contains("KeyguardRootView") || name.contains("Aod") || name.contains("Keyguard")) {
-                return true;
-            }
-            if (current.getParent() instanceof View) {
-                current = (View) current.getParent();
-            } else {
-                break;
-            }
-        }
-        return false;
     }
 }
