@@ -20,8 +20,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public class MainHook implements IXposedHookLoadPackage {
 
     // ======== РАЗМЕР ЧАСОВ ========
-    private static final float CLOCK_SCALE_X = 1.55f; // ширина 1.5
-    private static final float CLOCK_SCALE_Y = 1.30f; // высота 1.15
+    private static final float CLOCK_SCALE_X = 1.65f; // ширина 1.5
+    private static final float CLOCK_SCALE_Y = 1.35f; // высота 1.15
     // ==============================
 
     // ======== ОТСТУП КАРТОЧКИ («Фонарик включен» и т.п.) ОТ ДАТЫ, px ========
