@@ -5,7 +5,6 @@ import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 
 import java.lang.reflect.Field;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.Set;
 import java.util.WeakHashMap;
@@ -17,7 +16,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * LockCenter v7 (Pixel 7 Pro, Android 16).
+ * LockCenter v8 (Pixel 7 Pro, Android 16).
  *
  * 1) Small clock + date: before EVERY measure pass of KeyguardRootView the module
  *    re-applies its own ConstraintLayout rules (clock centered with zero margins,
@@ -46,7 +45,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String DATE_SUFFIX = ".DateSmartspaceView";
     private static final String ROOT_SUFFIX = ".KeyguardRootView";
     private static int barrierId = 0;
-    private static boolean hitApply, hitMeasure, hitDraw, loggedClockLp, loggedDateLp;
+    private static int placeholderId = 0;
+    private static int netLogs = 0;
+    private static boolean hitApply, hitMeasure, hitDraw, loggedClockLp;
 
     private static int logCount = 0;
     private static int shelfLogs = 0;
@@ -54,14 +55,14 @@ public class MainHook implements IXposedHookLoadPackage {
     private static int fixLogs = 0;
 
     private static void log(String m) {
-        if (logCount++ < 150) XposedBridge.log("[LockCenter] " + m);
+        if (logCount++ < 250) XposedBridge.log("[LockCenter] " + m);
     }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
         ClassLoader cl = lpparam.classLoader;
-        log("v7 started");
+        log("v8 started");
         try {
             hookKeyguard(cl);
         } catch (Throwable t) {
@@ -148,7 +149,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 public boolean onPreDraw() {
                                     try {
                                         if (!hitDraw) { hitDraw = true; log("entry preDraw fired"); }
-                                        fixKeyguard(root, false);
+                                        if (!fixKeyguard(root, false)) dateSafetyNet(root);
                                     } catch (Throwable t) {
                                         XposedBridge.log(t);
                                     }
@@ -161,7 +162,8 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void fixKeyguard(ViewGroup root, boolean inMeasure) {
+    /** Returns true if it changed any layout rule during this call. */
+    private static boolean fixKeyguard(ViewGroup root, boolean inMeasure) {
         View clock = null;
         View date = null;
         for (int i = 0; i < root.getChildCount(); i++) {
@@ -170,7 +172,7 @@ public class MainHook implements IXposedHookLoadPackage {
             if (n.endsWith(CLOCK_SUFFIX)) clock = c;           // small clock
             else if (n.endsWith(DATE_SUFFIX)) date = c;        // date (+ alarm)
         }
-        if (clock == null) return;
+        if (clock == null) return false;
 
         if (!loggedClockLp && clock.getLayoutParams() != null) {
             loggedClockLp = true;
@@ -179,25 +181,20 @@ public class MainHook implements IXposedHookLoadPackage {
                     + " endToEnd=" + getInt(l, "endToEnd")
                     + " marginStart=" + ((ViewGroup.MarginLayoutParams) l).getMarginStart());
         }
-        boolean a = enforceCentered(clock, root, inMeasure);
+        boolean changed = enforceCentered(clock, root, inMeasure);
         attachClockScaler(clock);
-        if (a && fixLogs++ < 10) log("small clock centered");
+        if (changed && fixLogs++ < 20) log("small clock centered");
 
-        if (date == null) return;
+        if (date == null) return changed;
         ViewGroup.LayoutParams lp = date.getLayoutParams();
         int cid = clock.getId();
-        if (lp == null || cid == View.NO_ID) return;
+        if (lp == null || cid == View.NO_ID) return changed;
 
-        if (!loggedDateLp) {
-            loggedDateLp = true;
-            log("date lp: startToEnd=" + getInt(lp, "startToEnd")
-                    + " topToBottom=" + getInt(lp, "topToBottom")
-                    + " topToTop=" + getInt(lp, "topToTop") + " clockId=" + cid);
+        boolean tiedToClock = isTiedToClock(lp, cid);
+        if (!tiedToClock) {
+            // large clock mode: leave the date alone and give the notification area back to the system
+            return changed | restorePlaceholder(root, date.getId(), inMeasure);
         }
-        boolean tiedToClock = getInt(lp, "startToEnd") == cid
-                || getInt(lp, "topToBottom") == cid
-                || getInt(lp, "topToTop") == cid;
-        if (!tiedToClock) return;   // large clock mode: leave the date alone
 
         boolean v = false;
         v |= setInt(lp, "topToTop", UNSET);
@@ -206,31 +203,81 @@ public class MainHook implements IXposedHookLoadPackage {
         v |= setInt(lp, "topToBottom", cid);
         boolean h = enforceCentered(date, root, inMeasure);
         if (v && !h) apply(date, lp, root, inMeasure);
-        if ((v || h) && fixLogs++ < 10) log("date placed under clock and centered");
+        if ((v || h) && fixLogs++ < 20) log("date placed under clock and centered");
+        changed |= v || h;
 
-        extendBarrier(root, date.getId(), inMeasure);
+        changed |= pointPlaceholderAtDate(root, date.getId(), inMeasure);
+        return changed;
     }
 
-    /** Make the barrier under the clock block include the date, so notifications start below it. */
-    private static void extendBarrier(ViewGroup root, int dateId, boolean inMeasure) {
-        if (dateId == View.NO_ID) return;
-        if (barrierId == 0) {
-            barrierId = root.getResources().getIdentifier(
-                    "smart_space_barrier_bottom", "id", "com.android.systemui");
+    private static boolean isTiedToClock(ViewGroup.LayoutParams lp, int cid) {
+        return getInt(lp, "startToEnd") == cid
+                || getInt(lp, "topToBottom") == cid
+                || getInt(lp, "topToTop") == cid;
+    }
+
+    private static int resId(ViewGroup root, String name) {
+        return root.getResources().getIdentifier(name, "id", "com.android.systemui");
+    }
+
+    /** The notification area normally starts below "smart_space_barrier_bottom"; point it at the date. */
+    private static boolean pointPlaceholderAtDate(ViewGroup root, int dateId, boolean inMeasure) {
+        if (dateId == View.NO_ID) return false;
+        if (placeholderId == 0) placeholderId = resId(root, "nssl_placeholder");
+        if (placeholderId == 0) return false;
+        View ph = root.findViewById(placeholderId);
+        if (ph == null || ph.getLayoutParams() == null) return false;
+        ViewGroup.LayoutParams lp = ph.getLayoutParams();
+        if (!setInt(lp, "topToBottom", dateId)) return false;
+        apply(ph, lp, root, inMeasure);
+        if (fixLogs++ < 20) log("notification area now starts below the date");
+        return true;
+    }
+
+    private static boolean restorePlaceholder(ViewGroup root, int dateId, boolean inMeasure) {
+        if (dateId == View.NO_ID || placeholderId == 0) return false;
+        View ph = root.findViewById(placeholderId);
+        if (ph == null || ph.getLayoutParams() == null) return false;
+        ViewGroup.LayoutParams lp = ph.getLayoutParams();
+        if (getInt(lp, "topToBottom") != dateId) return false;
+        if (barrierId == 0) barrierId = resId(root, "smart_space_barrier_bottom");
+        if (barrierId == 0) return false;
+        setInt(lp, "topToBottom", barrierId);
+        apply(ph, lp, root, inMeasure);
+        if (fixLogs++ < 20) log("notification area handed back to the system");
+        return true;
+    }
+
+    /**
+     * Safety net, runs every frame after layout: if the date (small clock mode) is still
+     * visibly off-center, no matter why, shift it back. Small AOD burn-in shifts are left alone.
+     */
+    private static void dateSafetyNet(ViewGroup root) {
+        View clock = null;
+        View date = null;
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View c = root.getChildAt(i);
+            String n = c.getClass().getName();
+            if (n.endsWith(CLOCK_SUFFIX)) clock = c;
+            else if (n.endsWith(DATE_SUFFIX)) date = c;
         }
-        if (barrierId == 0) return;
-        View b = root.findViewById(barrierId);
-        if (b == null) return;
-        try {
-            int[] ids = (int[]) XposedHelpers.callMethod(b, "getReferencedIds");
-            for (int id : ids) if (id == dateId) return;
-            int[] n = Arrays.copyOf(ids, ids.length + 1);
-            n[ids.length] = dateId;
-            XposedHelpers.callMethod(b, "setReferencedIds", (Object) n);
-            if (inMeasure) b.forceLayout(); else b.requestLayout();
-            if (fixLogs++ < 10) log("barrier extended with date (was " + ids.length + " ids)");
-        } catch (Throwable t) {
-            if (fixLogs++ < 10) log("barrier fix failed: " + t);
+        if (clock == null || date == null) return;
+        ViewGroup.LayoutParams lp = date.getLayoutParams();
+        if (lp == null || clock.getId() == View.NO_ID || !isTiedToClock(lp, clock.getId())) return;
+        if (date.getVisibility() != View.VISIBLE || date.getWidth() == 0 || root.getWidth() == 0) return;
+
+        float center = date.getLeft() + date.getTranslationX() + date.getWidth() / 2f;
+        float err = root.getWidth() / 2f - center;
+        if (Math.abs(err) <= 24f) return;
+        date.setTranslationX(date.getTranslationX() + err);
+        if (netLogs++ < 12) {
+            log("date was off-center by " + err + ": left=" + date.getLeft()
+                    + " w=" + date.getWidth() + " rootW=" + root.getWidth()
+                    + " lp[startToStart=" + getInt(lp, "startToStart")
+                    + " endToEnd=" + getInt(lp, "endToEnd")
+                    + " startToEnd=" + getInt(lp, "startToEnd")
+                    + " topToBottom=" + getInt(lp, "topToBottom")
+                    + " marginStart=" + ((ViewGroup.MarginLayoutParams) lp).getMarginStart() + "]");
         }
     }
 
