@@ -18,8 +18,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public class MainHook implements IXposedHookLoadPackage {
 
     // ======== РАЗМЕР ЧАСОВ ========
-    private static final float CLOCK_SCALE_X = 1.35f; // ширина 1.5
-    private static final float CLOCK_SCALE_Y = 1.15f; // высота 1.15
+    private static final float CLOCK_SCALE_X = 1.45f; // ширина 1.5
+    private static final float CLOCK_SCALE_Y = 1.25f; // высота 1.15
     // ==============================
 
     private static final int UNSET = -1;
