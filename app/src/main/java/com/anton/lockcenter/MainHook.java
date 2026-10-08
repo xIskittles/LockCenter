@@ -32,10 +32,12 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final float DATE_SCALE_Y = 1.10f;
     // ================================================
 
-    // ======== БОЛЬШИЕ ЧАСЫ (когда уведомлений нет): растяжение ТОЛЬКО в ширину ========
+    // ======== БОЛЬШИЕ ЧАСЫ (когда уведомлений нет): растяжение по ширине и (по желанию) по высоте ========
     // По умолчанию тот же множитель, что и у маленьких часов, поэтому отступы от краёв примерно такие же.
     // Хочешь шире или уже: поставь своё число (1.0 = как было).
-    private static final float LARGE_CLOCK_SCALE_X = 1.50f;
+    private static final float LARGE_CLOCK_SCALE_X = 1.80f;
+    // Высота больших часов (1.0 = как было, без изменений). Например 1.1 = на 10% выше.
+    private static final float LARGE_CLOCK_SCALE_Y = 1.50f;
     // ==================================================================================
 
     // ======== ОТСТУП КАРТОЧКИ («Фонарик включен» и т.п.) ОТ ДАТЫ, px ========
@@ -417,16 +419,23 @@ public class MainHook implements IXposedHookLoadPackage {
         large.getViewTreeObserver().addOnPreDrawListener(
                 new ViewTreeObserver.OnPreDrawListener() {
                     private float lastX = Float.NaN;
+                    private float lastY = Float.NaN;
 
                     @Override
                     public boolean onPreDraw() {
                         try {
                             if (large.getVisibility() != View.VISIBLE || large.getWidth() == 0) return true;
                             large.setPivotX(large.getWidth() / 2f);
+                            large.setPivotY(large.getHeight() / 2f);
                             float cx = large.getScaleX();
                             if (cx != lastX) {
                                 lastX = cx * LARGE_CLOCK_SCALE_X;
                                 large.setScaleX(lastX);
+                            }
+                            float cy = large.getScaleY();
+                            if (cy != lastY) {
+                                lastY = cy * LARGE_CLOCK_SCALE_Y;
+                                large.setScaleY(lastY);
                             }
                         } catch (Throwable t) {
                             XposedBridge.log(t);
