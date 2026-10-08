@@ -16,6 +16,8 @@ import androidx.appcompat.app.AppCompatActivity;
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.slider.Slider;
 
+import java.io.File;
+import java.io.FileWriter;
 import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
@@ -64,7 +66,7 @@ public class MainActivity extends AppCompatActivity {
 
         MaterialButton btnSave = findViewById(R.id.btn_save);
         btnSave.setOnClickListener(v -> {
-            saveConfigToSystem();
+            new Thread(this::saveConfigSync).start();
             sendSettingsBroadcast();
             Toast.makeText(this, "Настройки сохранены!", Toast.LENGTH_SHORT).show();
         });
@@ -73,9 +75,9 @@ public class MainActivity extends AppCompatActivity {
         btnRestart.setOnClickListener(v -> {
             Toast.makeText(this, "Перезагрузка SystemUI...", Toast.LENGTH_SHORT).show();
             new Thread(() -> {
-                saveConfigToSystemSync();
+                saveConfigSync();
                 try {
-                    Thread.sleep(100);
+                    Thread.sleep(150);
                     Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", "pkill -f com.android.systemui || killall com.android.systemui"});
                     p.waitFor();
                 } catch (Throwable t) {
@@ -85,19 +87,7 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private String buildConfigString() {
-        return "clock_scale_x=" + clockScaleX
-                + ";clock_scale_y=" + clockScaleY
-                + ";date_extra_gap_px=" + dateExtraGapPx
-                + ";date_scale_x=" + dateScaleX
-                + ";date_scale_y=" + dateScaleY
-                + ";large_clock_scale_x=" + largeClockScaleX
-                + ";large_clock_scale_y=" + largeClockScaleY
-                + ";card_top_margin_px=" + cardTopMarginPx
-                + ";notif_top_margin_px=" + notifTopMarginPx;
-    }
-
-    private void saveConfigToSystem() {
+    private synchronized void saveConfigSync() {
         prefs.edit()
                 .putFloat("clock_scale_x", clockScaleX)
                 .putFloat("clock_scale_y", clockScaleY)
@@ -110,15 +100,45 @@ public class MainActivity extends AppCompatActivity {
                 .putInt("notif_top_margin_px", notifTopMarginPx)
                 .apply();
 
-        new Thread(this::saveConfigToSystemSync).start();
-    }
+        // Безопасный формат через запятые без спецсимволов консоли
+        String cfgOneLine = "clock_scale_x=" + clockScaleX
+                + ",clock_scale_y=" + clockScaleY
+                + ",date_extra_gap_px=" + dateExtraGapPx
+                + ",date_scale_x=" + dateScaleX
+                + ",date_scale_y=" + dateScaleY
+                + ",large_clock_scale_x=" + largeClockScaleX
+                + ",large_clock_scale_y=" + largeClockScaleY
+                + ",card_top_margin_px=" + cardTopMarginPx
+                + ",notif_top_margin_px=" + notifTopMarginPx;
 
-    /** Записывает параметры в системную базу Settings.Global через Root */
-    private synchronized void saveConfigToSystemSync() {
-        String cfg = buildConfigString();
+        String fileContent = "clock_scale_x=" + clockScaleX + "\n"
+                + "clock_scale_y=" + clockScaleY + "\n"
+                + "date_extra_gap_px=" + dateExtraGapPx + "\n"
+                + "date_scale_x=" + dateScaleX + "\n"
+                + "date_scale_y=" + dateScaleY + "\n"
+                + "large_clock_scale_x=" + largeClockScaleX + "\n"
+                + "large_clock_scale_y=" + largeClockScaleY + "\n"
+                + "card_top_margin_px=" + cardTopMarginPx + "\n"
+                + "notif_top_margin_px=" + notifTopMarginPx + "\n";
+
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", "settings put global lockcenter_cfg '" + cfg + "'"});
-            p.waitFor();
+            // 1. В системную базу Settings.Global
+            Runtime.getRuntime().exec(new String[]{"su", "-c", "settings put global lockcenter_cfg \"" + cfgOneLine + "\""}).waitFor();
+
+            // 2. В системный файл каталога SystemUI
+            File localFile = new File(getFilesDir(), "lockcenter.conf");
+            try (FileWriter fw = new FileWriter(localFile)) {
+                fw.write(fileContent);
+                fw.flush();
+            }
+            String src = localFile.getAbsolutePath();
+            String cmd = "mkdir -p /data/user_de/0/com.android.systemui && "
+                    + "cp " + src + " /data/user_de/0/com.android.systemui/lockcenter.conf && "
+                    + "chmod 666 /data/user_de/0/com.android.systemui/lockcenter.conf && "
+                    + "mkdir -p /data/data/com.android.systemui && "
+                    + "cp " + src + " /data/data/com.android.systemui/lockcenter.conf && "
+                    + "chmod 666 /data/data/com.android.systemui/lockcenter.conf";
+            Runtime.getRuntime().exec(new String[]{"su", "-c", cmd}).waitFor();
         } catch (Throwable ignored) {}
     }
 
