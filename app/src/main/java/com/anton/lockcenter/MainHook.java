@@ -16,7 +16,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * LockCenter v8 (Pixel 7 Pro, Android 16).
+ * LockCenter v9 (Pixel 7 Pro, Android 16).
  *
  * 1) Small clock + date: before EVERY measure pass of KeyguardRootView the module
  *    re-applies its own ConstraintLayout rules (clock centered with zero margins,
@@ -62,7 +62,7 @@ public class MainHook implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
         ClassLoader cl = lpparam.classLoader;
-        log("v8 started");
+        log("v9 started");
         try {
             hookKeyguard(cl);
         } catch (Throwable t) {
@@ -149,7 +149,8 @@ public class MainHook implements IXposedHookLoadPackage {
                                 public boolean onPreDraw() {
                                     try {
                                         if (!hitDraw) { hitDraw = true; log("entry preDraw fired"); }
-                                        if (!fixKeyguard(root, false)) dateSafetyNet(root);
+                                        fixKeyguard(root, false);
+                                        centerNet(root);
                                     } catch (Throwable t) {
                                         XposedBridge.log(t);
                                     }
@@ -249,10 +250,12 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * Safety net, runs every frame after layout: if the date (small clock mode) is still
-     * visibly off-center, no matter why, shift it back. Small AOD burn-in shifts are left alone.
+     * Safety net, runs before every frame is drawn: while the small clock is shown, the clock
+     * and the date must sit in the middle of the screen. If they are visibly off (a system
+     * transition, a stale layout, whatever the reason) they are pushed back with translationX.
+     * Small shifts (AOD burn-in protection) are left alone.
      */
-    private static void dateSafetyNet(ViewGroup root) {
+    private static void centerNet(ViewGroup root) {
         View clock = null;
         View date = null;
         for (int i = 0; i < root.getChildCount(); i++) {
@@ -261,23 +264,43 @@ public class MainHook implements IXposedHookLoadPackage {
             if (n.endsWith(CLOCK_SUFFIX)) clock = c;
             else if (n.endsWith(DATE_SUFFIX)) date = c;
         }
-        if (clock == null || date == null) return;
-        ViewGroup.LayoutParams lp = date.getLayoutParams();
-        if (lp == null || clock.getId() == View.NO_ID || !isTiedToClock(lp, clock.getId())) return;
-        if (date.getVisibility() != View.VISIBLE || date.getWidth() == 0 || root.getWidth() == 0) return;
+        if (clock == null || root.getWidth() == 0) return;
+        if (clock.getVisibility() != View.VISIBLE || clock.getWidth() == 0
+                || clock.getAlpha() < 0.05f) return;   // large clock mode: not our business
 
-        float center = date.getLeft() + date.getTranslationX() + date.getWidth() / 2f;
+        netCenter("clock", clock, root);
+        if (date != null && date.getVisibility() == View.VISIBLE && date.getWidth() > 0
+                && date.getAlpha() > 0.05f) {
+            netCenter("date", date, root);
+        }
+    }
+
+    private static void netCenter(String name, View v, ViewGroup root) {
+        float center = v.getLeft() + v.getTranslationX() + v.getWidth() / 2f;
         float err = root.getWidth() / 2f - center;
-        if (Math.abs(err) <= 24f) return;
-        date.setTranslationX(date.getTranslationX() + err);
-        if (netLogs++ < 12) {
-            log("date was off-center by " + err + ": left=" + date.getLeft()
-                    + " w=" + date.getWidth() + " rootW=" + root.getWidth()
-                    + " lp[startToStart=" + getInt(lp, "startToStart")
-                    + " endToEnd=" + getInt(lp, "endToEnd")
-                    + " startToEnd=" + getInt(lp, "startToEnd")
-                    + " topToBottom=" + getInt(lp, "topToBottom")
-                    + " marginStart=" + ((ViewGroup.MarginLayoutParams) lp).getMarginStart() + "]");
+        if (Math.abs(err) <= 30f) return;
+        v.setTranslationX(v.getTranslationX() + err);
+        if (Math.abs(err) > 60f && netLogs++ < 25) {
+            ViewGroup.LayoutParams lp = v.getLayoutParams();
+            String rules = "";
+            if (lp != null) {
+                rules = " lp[startToStart=" + getInt(lp, "startToStart")
+                        + " endToEnd=" + getInt(lp, "endToEnd")
+                        + " startToEnd=" + getInt(lp, "startToEnd")
+                        + " topToBottom=" + getInt(lp, "topToBottom")
+                        + " bias=" + getFloat(lp, "horizontalBias")
+                        + " marginStart=" + ((ViewGroup.MarginLayoutParams) lp).getMarginStart() + "]";
+            }
+            log(name + " was off-center by " + err + ": left=" + v.getLeft()
+                    + " w=" + v.getWidth() + " tx=" + v.getTranslationX() + rules);
+        }
+    }
+
+    private static float getFloat(Object lp, String name) {
+        try {
+            return lp.getClass().getField(name).getFloat(lp);
+        } catch (Throwable t) {
+            return -2f;
         }
     }
 
