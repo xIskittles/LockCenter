@@ -50,7 +50,6 @@ public class MainHook implements IXposedHookLoadPackage {
     private static boolean receiverRegistered = false;
     private static long lastCheckTime = 0;
 
-    /** Загрузка конфигурации из системной базы Settings.Global */
     public static void loadConfigFromSystem(Context context) {
         if (context == null) return;
         try {
@@ -147,6 +146,16 @@ public class MainHook implements IXposedHookLoadPackage {
         return v != null && v.getClass().getName().contains("BcSmartspaceView");
     }
 
+    private static View findSmallClock(ViewGroup root) {
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View c = root.getChildAt(i);
+            if (c.getClass().getName().endsWith(CLOCK_SUFFIX)) {
+                return c;
+            }
+        }
+        return null;
+    }
+
     private static float dateContentDelta(View date) {
         if (!(date instanceof ViewGroup) || date.getWidth() <= 0) return 0f;
         float[] b = {Float.MAX_VALUE, -Float.MAX_VALUE};
@@ -223,7 +232,7 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-    /** Принудительно удерживает отступ даты по вертикали */
+    /** На AOD дата следует синхронно за смещением часов вниз */
     private static void hookDateTranslationY(ClassLoader cl) {
         Class<?> viewClass = XposedHelpers.findClass("android.view.View", cl);
         XposedBridge.hookAllMethods(viewClass, "setTranslationY", new XC_MethodHook() {
@@ -235,7 +244,11 @@ public class MainHook implements IXposedHookLoadPackage {
                 View parent = (View) v.getParent();
                 if (parent == null || !parent.getClass().getName().endsWith(ROOT_SUFFIX)) return;
 
-                param.args[0] = (float) dateExtraGapPx;
+                ViewGroup root = (ViewGroup) parent;
+                View clock = findSmallClock(root);
+                float clockTy = clock != null ? clock.getTranslationY() : 0f;
+
+                param.args[0] = clockTy + (float) dateExtraGapPx;
             }
         });
     }
@@ -352,7 +365,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     m.setMarginEnd(0);
                     m.leftMargin = 0;
                     m.rightMargin = 0;
-                    m.topMargin = 20 + dateExtraGapPx;
+                    m.topMargin = 20;
                 }
 
                 apply(dateView, lp, root, inMeasure);
@@ -381,14 +394,14 @@ public class MainHook implements IXposedHookLoadPackage {
 
                 if (lp instanceof ViewGroup.MarginLayoutParams) {
                     ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-                    m.topMargin = 12 + cardTopMarginPx;
+                    m.topMargin = 12;
                 }
 
                 apply(cardView, lp, root, inMeasure);
             }
         }
 
-        // 3. Точка привязки уведомлений (с учётом отступа из настроек)
+        // 3. Точка привязки уведомлений
         int anchorId = View.NO_ID;
         if (cardView != null && cardView.getVisibility() == View.VISIBLE && cardView.getHeight() > 0) {
             anchorId = cardView.getId();
@@ -408,6 +421,7 @@ public class MainHook implements IXposedHookLoadPackage {
         float rootShift = root.getLeft() + root.getTranslationX();
         float targetCenterInRoot = (displayWidth / 2f) - rootShift;
 
+        View clock = null;
         View dateView = null;
         View cardView = null;
 
@@ -415,7 +429,8 @@ public class MainHook implements IXposedHookLoadPackage {
             View v = root.getChildAt(i);
             if (v.getVisibility() != View.VISIBLE) continue;
 
-            if (isDateOnly(v)) dateView = v;
+            if (v.getClass().getName().endsWith(CLOCK_SUFFIX)) clock = v;
+            else if (isDateOnly(v)) dateView = v;
             else if (isSmartspaceCard(v)) cardView = v;
 
             if (isDateOnly(v) || v.getClass().getName().endsWith(CLOCK_SUFFIX)) {
@@ -431,27 +446,30 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
 
-        // Смещение даты
+        // Смещение часов на AOD
+        float clockTy = clock != null ? clock.getTranslationY() : 0f;
+
+        // Дата ВСЕГДА следует за смещением часов вниз (на экране и в AOD)
         if (dateView != null && dateView.getVisibility() == View.VISIBLE) {
-            float desiredDateTy = (float) dateExtraGapPx;
+            float desiredDateTy = clockTy + (float) dateExtraGapPx;
             if (Math.abs(dateView.getTranslationY() - desiredDateTy) > 0.5f) {
                 dateView.setTranslationY(desiredDateTy);
             }
         }
 
-        // Смещение фонарика
+        // Карточка фонарика следует за датой
         if (cardView != null && cardView.getVisibility() == View.VISIBLE) {
-            float desiredCardTy = (float) (dateExtraGapPx + cardTopMarginPx);
+            float desiredCardTy = clockTy + (float) (dateExtraGapPx + cardTopMarginPx);
             if (Math.abs(cardView.getTranslationY() - desiredCardTy) > 0.5f) {
                 cardView.setTranslationY(desiredCardTy);
             }
         }
 
-        // Смещение уведомлений вниз или вверх по ползунку
+        // Уведомления следуют вниз за всем блоком
         if (placeholderId != 0) {
             View ph = root.findViewById(placeholderId);
             if (ph != null) {
-                float baseOffset = dateExtraGapPx + (cardView != null && cardView.getVisibility() == View.VISIBLE ? cardTopMarginPx : 0);
+                float baseOffset = clockTy + dateExtraGapPx + (cardView != null && cardView.getVisibility() == View.VISIBLE ? cardTopMarginPx : 0);
                 float desiredPhTy = baseOffset + notifTopMarginPx;
                 if (Math.abs(ph.getTranslationY() - desiredPhTy) > 0.5f) {
                     ph.setTranslationY(desiredPhTy);
@@ -557,10 +575,6 @@ public class MainHook implements IXposedHookLoadPackage {
         if (ph == null || ph.getLayoutParams() == null) return;
         ViewGroup.LayoutParams lp = ph.getLayoutParams();
         setInt(lp, "topToBottom", anchorId);
-        if (lp instanceof ViewGroup.MarginLayoutParams) {
-            ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-            m.topMargin = notifTopMarginPx;
-        }
         apply(ph, lp, root, inMeasure);
     }
 
@@ -634,9 +648,9 @@ public class MainHook implements IXposedHookLoadPackage {
                                 try {
                                     int screenWidth = v.getResources().getDisplayMetrics().widthPixels;
                                     if (isShelf) {
-                                        centerShelf((ViewGroup) v);
+                                        centerShelf((ViewGroup) v, screenWidth);
                                     } else if (isAodContainer(v)) {
-                                        centerAodIcons((ViewGroup) v);
+                                        centerAodIcons((ViewGroup) v, screenWidth);
                                     }
                                 } catch (Throwable ignored) {}
                                 return true;
@@ -657,7 +671,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void centerAodIcons(ViewGroup c) {
+    private static void centerAodIcons(ViewGroup c, int screenWidth) {
         if (c.getVisibility() != View.VISIBLE || c.getWidth() == 0) return;
 
         int displayWidth = c.getResources().getDisplayMetrics().widthPixels;
@@ -690,7 +704,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void centerShelf(ViewGroup shelf) {
+    private static void centerShelf(ViewGroup shelf, int screenWidth) {
         if (shelf.getVisibility() != View.VISIBLE || shelf.getWidth() == 0
                 || shelf.getAlpha() < 0.01f) return;
         View parent = (View) shelf.getParent();
