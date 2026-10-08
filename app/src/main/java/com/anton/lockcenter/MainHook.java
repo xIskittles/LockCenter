@@ -18,9 +18,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public class MainHook implements IXposedHookLoadPackage {
 
     // ================= НАСТРОЙКА РАЗМЕРА ЧАСОВ =================
-    // 1.0 = стандарт. Сделали еще шире в ширину по твоему запросу:
-    private static final float CLOCK_SCALE_X = 1.5f; // ширина
-    private static final float CLOCK_SCALE_Y = 1.14f; // высота
+    private static final float CLOCK_SCALE_X = 1.50f; // растянуты в ширину на 1.5
+    private static final float CLOCK_SCALE_Y = 1.15f; // высота
     // ==========================================================
 
     private static final int UNSET = -1;
@@ -65,15 +64,14 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static boolean isDateView(View v) {
         if (v == null) return false;
-        String name = v.getClass().getName();
-        return name.contains("Smartspace") || name.contains("VariableDate");
+        String n = v.getClass().getName();
+        return n.contains("DateSmartspaceView") || n.contains("BcSmartspaceView") || n.contains("Smartspace");
     }
 
     private static boolean isSmallClock(View v) {
         if (v == null) return false;
-        String name = v.getClass().getName();
-        // Маленькие часы имеют высоту < 300px (большие часы занимают > 800px)
-        return name.endsWith(CLOCK_SUFFIX) && v.getHeight() < 300;
+        String n = v.getClass().getName();
+        return n.endsWith(CLOCK_SUFFIX) && v.getHeight() < 300;
     }
 
     private static void hookKeyguard(ClassLoader cl) {
@@ -84,9 +82,9 @@ public class MainHook implements IXposedHookLoadPackage {
         Class<?> rootClass = XposedHelpers.findClassIfExists(
                 "com.android.systemui.keyguard.ui.view.KeyguardRootView", cl);
 
-        // 1. ПЕРЕХВАТ ДО НАЧАЛА СИСТЕМНОЙ АНИМАЦИИ (убирает 1-секундный улет даты вправо)
+        // 1. Устраняем 1-секундный улет даты: меняем правила ДО применения анимации
         if (constraintSet != null) {
-            XC_MethodHook beforeApply = new XC_MethodHook() {
+            XC_MethodHook applyHook = new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     try {
@@ -105,8 +103,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     } catch (Throwable ignored) {}
                 }
             };
-            XposedBridge.hookAllMethods(constraintSet, "applyTo", beforeApply);
-            XposedBridge.hookAllMethods(constraintSet, "applyToWithoutCheck", beforeApply);
+            XposedBridge.hookAllMethods(constraintSet, "applyTo", applyHook);
+            XposedBridge.hookAllMethods(constraintSet, "applyToWithoutCheck", applyHook);
         }
 
         // 2. Хук на onMeasure
@@ -127,7 +125,7 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
 
-        // 3. Непрерывный контроль позиции на каждом кадре (исправляет сдвиг AOD)
+        // 3. Контроль отрисовки: гарантирует центр на обычном экране и AOD без наложений
         if (rootClass != null) {
             XposedBridge.hookAllConstructors(rootClass, new XC_MethodHook() {
                 @Override
@@ -140,7 +138,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 public boolean onPreDraw() {
                                     try {
                                         fixKeyguard(root, false);
-                                        absoluteCenterKeyguard(root);
+                                        centerNet(root);
                                     } catch (Throwable ignored) {}
                                     return true;
                                 }
@@ -150,22 +148,20 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Модифицирует системный ConstraintSet ДО того, как система начнет раскладку */
     private static void patchConstraintSet(Object cs, ViewGroup root) {
-        int smallClockId = resId(root, "small_clock_view");
-        if (smallClockId == 0) smallClockId = resId(root, "lockscreen_clock_view");
-
-        View smallClock = null;
+        View clock = null;
         View date = null;
         for (int i = 0; i < root.getChildCount(); i++) {
             View c = root.getChildAt(i);
-            if (isSmallClock(c)) smallClock = c;
+            if (isSmallClock(c)) clock = c;
             else if (isDateView(c)) date = c;
         }
 
-        int clockId = smallClock != null ? smallClock.getId() : smallClockId;
+        int clockId = clock != null ? clock.getId() : resId(root, "small_clock_view");
+        if (clockId == 0 || clockId == View.NO_ID) clockId = resId(root, "lockscreen_clock_view");
+
         int dateId = date != null ? date.getId() : resId(root, "date_smartspace_view");
-        if (dateId == 0) dateId = resId(root, "bc_smartspace_view");
+        if (dateId == 0 || dateId == View.NO_ID) dateId = resId(root, "bc_smartspace_view");
 
         if (clockId > 0 && clockId != View.NO_ID) {
             try {
@@ -186,7 +182,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedHelpers.callMethod(cs, "setHorizontalBias", dateId, 0.5f);
                 if (clockId > 0 && clockId != View.NO_ID) {
                     XposedHelpers.callMethod(cs, "clear", dateId, CS_TOP);
-                    XposedHelpers.callMethod(cs, "connect", dateId, CS_TOP, clockId, CS_BOTTOM, 0);
+                    XposedHelpers.callMethod(cs, "connect", dateId, CS_TOP, clockId, CS_BOTTOM, 20);
                 }
             } catch (Throwable ignored) {}
         }
@@ -199,86 +195,102 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void fixKeyguard(ViewGroup root, boolean inMeasure) {
+    private static boolean fixKeyguard(ViewGroup root, boolean inMeasure) {
         View clock = null;
         View date = null;
         for (int i = 0; i < root.getChildCount(); i++) {
             View c = root.getChildAt(i);
-            if (isSmallClock(c)) clock = c;
+            String n = c.getClass().getName();
+            if (n.endsWith(CLOCK_SUFFIX)) clock = c;
             else if (isDateView(c)) date = c;
         }
+        if (clock == null) return false;
 
-        if (clock != null) {
-            enforceCentered(clock, root, inMeasure);
-            scaleClock(clock);
+        // Если у часов нет ID, создаем его, иначе ConstraintLayout не сможет привязать дату под часы
+        if (clock.getId() == View.NO_ID) {
+            clock.setId(View.generateViewId());
+        }
+        int cid = clock.getId();
+
+        boolean changed = enforceCentered(clock, root, inMeasure);
+        scaleClock(clock);
+
+        if (date == null) return changed;
+        if (date.getId() == View.NO_ID) {
+            date.setId(View.generateViewId());
         }
 
-        if (date != null && clock != null) {
-            ViewGroup.LayoutParams lp = date.getLayoutParams();
-            if (lp != null) {
-                int cid = clock.getId();
-                setInt(lp, "startToEnd", UNSET);
-                setInt(lp, "leftToRight", UNSET);
-                setInt(lp, "topToTop", UNSET);
+        ViewGroup.LayoutParams lp = date.getLayoutParams();
+        if (lp == null) return changed;
 
-                if (cid != View.NO_ID) {
-                    setInt(lp, "topToBottom", cid);
-                }
+        boolean v = false;
+        v |= setInt(lp, "topToTop", UNSET);
+        v |= setInt(lp, "bottomToTop", UNSET);
+        v |= setInt(lp, "bottomToBottom", UNSET);
+        v |= setInt(lp, "startToEnd", UNSET);
+        v |= setInt(lp, "leftToRight", UNSET);
+        v |= setInt(lp, "topToBottom", cid);
 
-                setInt(lp, "startToStart", PARENT);
-                setInt(lp, "endToEnd", PARENT);
-                setFloat(lp, "horizontalBias", 0.5f);
+        boolean h = enforceCentered(date, root, inMeasure);
 
-                if (lp instanceof ViewGroup.MarginLayoutParams) {
-                    ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-                    m.setMarginStart(0);
-                    m.setMarginEnd(0);
-                    m.leftMargin = 0;
-                    m.rightMargin = 0;
-                }
-
-                apply(date, lp, root, inMeasure);
+        // Отступ 20px, чтобы увеличенные часы не налезали на дату
+        if (lp instanceof ViewGroup.MarginLayoutParams) {
+            ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
+            if (m.topMargin < 20) {
+                m.topMargin = 20;
+                v = true;
             }
-
-            pointPlaceholderAtDate(root, date.getId(), inMeasure);
         }
+
+        if (v || h) apply(date, lp, root, inMeasure);
+        changed |= v || h;
+
+        changed |= pointPlaceholderAtDate(root, date.getId(), inMeasure);
+        return changed;
     }
 
     /**
-     * Центрирование по абсолютному центру физического экрана.
-     * Нивелирует системный сдвиг AOD (burn-in offset).
+     * Предотвращает наложение даты на часы и центрирует всё по физическому центру дисплея (включая AOD)
      */
-    private static void absoluteCenterKeyguard(ViewGroup root) {
-        int screenWidth = root.getResources().getDisplayMetrics().widthPixels;
-        if (screenWidth <= 0) return;
-
-        int[] rootLoc = new int[2];
-        root.getLocationOnScreen(rootLoc);
-
+    private static void centerNet(ViewGroup root) {
         View clock = null;
         View date = null;
         for (int i = 0; i < root.getChildCount(); i++) {
             View c = root.getChildAt(i);
-            if (isSmallClock(c)) clock = c;
+            String n = c.getClass().getName();
+            if (n.endsWith(CLOCK_SUFFIX)) clock = c;
             else if (isDateView(c)) date = c;
         }
 
-        if (clock != null && clock.getVisibility() == View.VISIBLE && clock.getWidth() > 0) {
-            alignToScreenCenter(clock, rootLoc[0], screenWidth);
-        }
+        if (clock == null || root.getWidth() == 0) return;
+        if (clock.getVisibility() != View.VISIBLE || clock.getWidth() == 0 || clock.getAlpha() < 0.05f || clock.getHeight() > 300) return;
 
-        if (date != null && date.getVisibility() == View.VISIBLE && date.getWidth() > 0) {
-            alignToScreenCenter(date, rootLoc[0], screenWidth);
+        int screenWidth = root.getResources().getDisplayMetrics().widthPixels;
+        float rootShift = root.getLeft() + root.getTranslationX();
+        float targetCenterInRoot = (screenWidth / 2f) - rootShift;
+
+        // Центрируем часы
+        netCenter(clock, targetCenterInRoot);
+
+        // Центрируем дату и исключаем наложение по вертикали
+        if (date != null && date.getVisibility() == View.VISIBLE && date.getWidth() > 0 && date.getAlpha() > 0.05f) {
+            netCenter(date, targetCenterInRoot);
+
+            // Физическая защита от наложения: дата гарантированно начинается НИЖЕ часов
+            float visualClockBottom = clock.getTop() + clock.getTranslationY() + clock.getHeight() * (1f + (CLOCK_SCALE_Y - 1f) / 2f);
+            float desiredDateTop = visualClockBottom + 16f;
+            float currentDateTop = date.getTop() + date.getTranslationY();
+            if (currentDateTop < desiredDateTop) {
+                date.setTranslationY(date.getTranslationY() + (desiredDateTop - currentDateTop));
+            }
         }
     }
 
-    private static void alignToScreenCenter(View v, int rootScreenLeft, int screenWidth) {
-        float currentCenterOnScreen = rootScreenLeft + v.getLeft() + v.getTranslationX() + (v.getWidth() / 2f);
-        float targetCenterOnScreen = screenWidth / 2f;
-        float diff = targetCenterOnScreen - currentCenterOnScreen;
-
-        if (Math.abs(diff) > 0.5f) {
-            v.setTranslationX(v.getTranslationX() + diff);
+    private static void netCenter(View v, float targetCenterInRoot) {
+        float center = v.getLeft() + v.getTranslationX() + v.getWidth() / 2f;
+        float err = targetCenterInRoot - center;
+        if (Math.abs(err) > 0.5f) {
+            v.setTranslationX(v.getTranslationX() + err);
         }
     }
 
@@ -292,16 +304,16 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void pointPlaceholderAtDate(ViewGroup root, int dateId, boolean inMeasure) {
-        if (dateId == View.NO_ID) return;
+    private static boolean pointPlaceholderAtDate(ViewGroup root, int dateId, boolean inMeasure) {
+        if (dateId == View.NO_ID) return false;
         if (placeholderId == 0) placeholderId = resId(root, "nssl_placeholder");
-        if (placeholderId == 0) return;
+        if (placeholderId == 0) return false;
         View ph = root.findViewById(placeholderId);
-        if (ph == null || ph.getLayoutParams() == null) return;
+        if (ph == null || ph.getLayoutParams() == null) return false;
         ViewGroup.LayoutParams lp = ph.getLayoutParams();
-        if (setInt(lp, "topToBottom", dateId)) {
-            apply(ph, lp, root, inMeasure);
-        }
+        if (!setInt(lp, "topToBottom", dateId)) return false;
+        apply(ph, lp, root, inMeasure);
+        return true;
     }
 
     private static int resId(ViewGroup root, String name) {
@@ -312,23 +324,29 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void enforceCentered(View v, ViewGroup parent, boolean inMeasure) {
+    private static boolean enforceCentered(View v, ViewGroup parent, boolean inMeasure) {
         ViewGroup.LayoutParams lp = v.getLayoutParams();
-        if (lp == null || !lp.getClass().getName().contains("ConstraintLayout")) return;
+        if (lp == null || !lp.getClass().getName().contains("ConstraintLayout")) return false;
+        boolean ch = false;
         String[] clear = {"leftToLeft", "leftToRight", "rightToLeft", "rightToRight",
                 "startToEnd", "endToStart"};
-        for (String f : clear) setInt(lp, f, UNSET);
-        setInt(lp, "startToStart", PARENT);
-        setInt(lp, "endToEnd", PARENT);
-        setFloat(lp, "horizontalBias", 0.5f);
+        for (String f : clear) ch |= setInt(lp, f, UNSET);
+        ch |= setInt(lp, "startToStart", PARENT);
+        ch |= setInt(lp, "endToEnd", PARENT);
+        ch |= setFloat(lp, "horizontalBias", 0.5f);
         if (lp instanceof ViewGroup.MarginLayoutParams) {
             ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-            m.setMarginStart(0);
-            m.setMarginEnd(0);
-            m.leftMargin = 0;
-            m.rightMargin = 0;
+            if (m.getMarginStart() != 0 || m.getMarginEnd() != 0
+                    || m.leftMargin != 0 || m.rightMargin != 0) {
+                m.setMarginStart(0);
+                m.setMarginEnd(0);
+                m.leftMargin = 0;
+                m.rightMargin = 0;
+                ch = true;
+            }
         }
-        apply(v, lp, parent, inMeasure);
+        if (ch) apply(v, lp, parent, inMeasure);
+        return ch;
     }
 
     private static void apply(View v, ViewGroup.LayoutParams lp, ViewGroup parent, boolean inMeasure) {
@@ -361,7 +379,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ------------------------------------------------ Иконки на Lockscreen и AOD
+    // ------------------------------------------------ Shelf pill + AOD icons
 
     private static void hookPreDraw(ClassLoader cl, String className, final boolean isShelf) {
         Class<?> c = XposedHelpers.findClassIfExists(className, cl);
@@ -401,7 +419,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Выравнивает группу иконок на AOD строго по центру экрана */
+    /** Выравнивает иконки на AOD строго по физическому центру дисплея */
     private static void centerAodIcons(ViewGroup c, int screenWidth) {
         if (c.getVisibility() != View.VISIBLE || c.getWidth() == 0) return;
 
@@ -410,37 +428,37 @@ public class MainHook implements IXposedHookLoadPackage {
 
         float minL = Float.MAX_VALUE;
         float maxR = -Float.MAX_VALUE;
-        int count = 0;
+        int n = 0;
         for (int i = 0; i < c.getChildCount(); i++) {
             View ch = c.getChildAt(i);
-            if (ch.getVisibility() != View.VISIBLE || ch.getWidth() == 0 || ch.getAlpha() < 0.05f) continue;
+            if (ch.getVisibility() != View.VISIBLE || ch.getWidth() == 0
+                    || ch.getAlpha() < 0.05f) continue;
             float l = ch.getLeft() + ch.getTranslationX();
             minL = Math.min(minL, l);
             maxR = Math.max(maxR, l + ch.getWidth());
-            count++;
+            n++;
         }
-        if (count == 0) return;
+        if (n == 0) return;
 
         float groupCenterOnScreen = cLoc[0] + minL + (maxR - minL) / 2f;
         float targetCenter = screenWidth / 2f;
-        float delta = targetCenter - groupCenterOnScreen;
+        float shift = targetCenter - groupCenterOnScreen;
 
-        if (Math.abs(delta) > 0.5f) {
+        if (Math.abs(shift) > 0.5f) {
             for (int i = 0; i < c.getChildCount(); i++) {
                 View ch = c.getChildAt(i);
-                ch.setTranslationX(ch.getTranslationX() + delta);
+                ch.setTranslationX(ch.getTranslationX() + shift);
             }
         }
     }
 
     /** Центрирует круглый кружок уведомления (Shelf) на экране блокировки */
     private static void centerShelf(ViewGroup shelf, int screenWidth) {
-        if (shelf.getVisibility() != View.VISIBLE || shelf.getWidth() == 0 || shelf.getAlpha() < 0.01f) return;
+        if (shelf.getVisibility() != View.VISIBLE || shelf.getWidth() == 0
+                || shelf.getAlpha() < 0.01f) return;
 
         int full = shelf.getWidth();
         int pill = pillWidth(shelf);
-
-        // Если уведомления раскрыты на всю ширину — не трогаем
         if (pill <= 0 || full - pill <= 100) {
             if (Math.abs(shelf.getTranslationX()) > 1f) {
                 shelf.setTranslationX(0f);
