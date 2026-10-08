@@ -24,6 +24,20 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final float CLOCK_SCALE_Y = 1.50f; // высота 1.15
     // ==============================
 
+    // ======== ДАТА (когда есть уведомления) ========
+    // Доп. зазор между часами и датой, px. Дата реально опускается примерно на это число.
+    private static final int DATE_EXTRA_GAP_PX = 5;
+    // Размер даты (1.0 = как было): чуть больше, в ширину немного сильнее, чем в высоту.
+    private static final float DATE_SCALE_X = 1.15f;
+    private static final float DATE_SCALE_Y = 1.10f;
+    // ================================================
+
+    // ======== БОЛЬШИЕ ЧАСЫ (когда уведомлений нет): растяжение ТОЛЬКО в ширину ========
+    // По умолчанию тот же множитель, что и у маленьких часов, поэтому отступы от краёв примерно такие же.
+    // Хочешь шире или уже: поставь своё число (1.0 = как было).
+    private static final float LARGE_CLOCK_SCALE_X = CLOCK_SCALE_X;
+    // ==================================================================================
+
     // ======== ОТСТУП КАРТОЧКИ («Фонарик включен» и т.п.) ОТ ДАТЫ, px ========
     // 0 = сразу под рамкой даты (визуально ~50 px от текста). Увеличь, если хочешь больше воздуха.
     private static final int CARD_TOP_MARGIN_PX = 0;
@@ -36,12 +50,14 @@ public class MainHook implements IXposedHookLoadPackage {
             Collections.newSetFromMap(new WeakHashMap<View, Boolean>());
 
     private static final String CLOCK_SUFFIX = ".FlexClockTextView";
+    private static final String LARGE_CLOCK_SUFFIX = ".FlexClockViewGroup";
     private static final String ROOT_SUFFIX = ".KeyguardRootView";
 
     private static int placeholderId = 0;
     private static int cardId = 0;
     private static String lastChildSig = "";
     private static int diagLogs = 0;
+    private static int fvarLogs = 0;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -213,11 +229,21 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void fixKeyguard(ViewGroup root, boolean inMeasure) {
         View clock = null;
         View date = null;
+        View largeClock = null;
         for (int i = 0; i < root.getChildCount(); i++) {
             View c = root.getChildAt(i);
             String n = c.getClass().getName();
             if (n.endsWith(CLOCK_SUFFIX)) clock = c;
+            else if (n.endsWith(LARGE_CLOCK_SUFFIX)) largeClock = c;
             else if (isDateView(c)) date = c;
+        }
+
+        if (largeClock != null) {
+            attachLargeClockScaler(largeClock);
+        }
+
+        if (date != null) {
+            attachDateScaler(date);
         }
 
         if (clock != null) {
@@ -247,7 +273,9 @@ public class MainHook implements IXposedHookLoadPackage {
                     m.setMarginEnd(0);
                     m.leftMargin = 0;
                     m.rightMargin = 0;
-                    m.topMargin = 24; // отступ вниз, чтобы увеличенные часы не налезали на дату
+                    // Дата зажата между двумя привязками, поэтому сдвигается на половину изменения отступа:
+                    // чтобы опустить её на DATE_EXTRA_GAP_PX, отступ увеличиваем вдвое больше.
+                    m.topMargin = 24 + 2 * DATE_EXTRA_GAP_PX;
                 }
 
                 apply(date, lp, root, inMeasure);
@@ -376,6 +404,88 @@ public class MainHook implements IXposedHookLoadPackage {
         lastChildSig = sg;
         diagLogs++;
         XposedBridge.log("[LockCenter] keyguard children:" + full);
+    }
+
+    /**
+     * Большие часы (без уведомлений): растягиваем только по горизонтали.
+     * Множитель накладывается поверх того, что ставит система (анимации, AOD),
+     * поэтому не ломает переходы между большими и маленькими часами.
+     */
+    private static void attachLargeClockScaler(final View large) {
+        if (!HOOKED.add(large)) return;
+        logDigitFont(large);
+        large.getViewTreeObserver().addOnPreDrawListener(
+                new ViewTreeObserver.OnPreDrawListener() {
+                    private float lastX = Float.NaN;
+
+                    @Override
+                    public boolean onPreDraw() {
+                        try {
+                            if (large.getVisibility() != View.VISIBLE || large.getWidth() == 0) return true;
+                            large.setPivotX(large.getWidth() / 2f);
+                            float cx = large.getScaleX();
+                            if (cx != lastX) {
+                                lastX = cx * LARGE_CLOCK_SCALE_X;
+                                large.setScaleX(lastX);
+                            }
+                        } catch (Throwable t) {
+                            XposedBridge.log(t);
+                        }
+                        return true;
+                    }
+                });
+    }
+
+    /** Диагностика: какие оси шрифта (вес, ширина) использует большой циферблат. */
+    private static void logDigitFont(View group) {
+        if (!(group instanceof ViewGroup) || fvarLogs >= 3) return;
+        ViewGroup g = (ViewGroup) group;
+        for (int i = 0; i < g.getChildCount() && fvarLogs < 3; i++) {
+            View c = g.getChildAt(i);
+            if (c instanceof TextView) {
+                fvarLogs++;
+                try {
+                    XposedBridge.log("[LockCenter] large clock digit fvar="
+                            + ((TextView) c).getFontVariationSettings());
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    /**
+     * Дата чуть крупнее. Масштаб идёт вокруг центра САМОГО ТЕКСТА (не рамки),
+     * поэтому центровка по экрану не сдвигается. Множитель накладывается поверх системного.
+     */
+    private static void attachDateScaler(final View date) {
+        if (!HOOKED.add(date)) return;
+        date.getViewTreeObserver().addOnPreDrawListener(
+                new ViewTreeObserver.OnPreDrawListener() {
+                    private float lastX = Float.NaN;
+                    private float lastY = Float.NaN;
+
+                    @Override
+                    public boolean onPreDraw() {
+                        try {
+                            if (date.getVisibility() != View.VISIBLE || date.getWidth() == 0) return true;
+                            date.setPivotX(date.getWidth() / 2f - dateContentDelta(date));
+                            date.setPivotY(date.getHeight() / 2f);
+                            float cx = date.getScaleX();
+                            if (cx != lastX) {
+                                lastX = cx * DATE_SCALE_X;
+                                date.setScaleX(lastX);
+                            }
+                            float cy = date.getScaleY();
+                            if (cy != lastY) {
+                                lastY = cy * DATE_SCALE_Y;
+                                date.setScaleY(lastY);
+                            }
+                        } catch (Throwable t) {
+                            XposedBridge.log(t);
+                        }
+                        return true;
+                    }
+                });
     }
 
     private static void attachClockScaler(final View clock) {
