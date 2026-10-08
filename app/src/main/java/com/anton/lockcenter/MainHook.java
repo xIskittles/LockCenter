@@ -11,6 +11,9 @@ import android.view.ViewParent;
 import android.view.ViewTreeObserver;
 import android.widget.TextView;
 
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
 import java.lang.reflect.Field;
 import java.util.Collections;
 import java.util.Set;
@@ -50,42 +53,64 @@ public class MainHook implements IXposedHookLoadPackage {
     private static boolean receiverRegistered = false;
     private static long lastCheckTime = 0;
 
-    public static void loadConfigFromSystem(Context context) {
-        if (context == null) return;
-        try {
-            String cfg = Settings.Global.getString(context.getContentResolver(), "lockcenter_cfg");
-            if (cfg != null && !cfg.isEmpty()) {
-                parseConfig(cfg);
-            }
-        } catch (Throwable ignored) {}
+    public static void loadConfig(Context context) {
+        // 1. Из базы Settings.Global
+        if (context != null) {
+            try {
+                String cfg = Settings.Global.getString(context.getContentResolver(), "lockcenter_cfg");
+                if (cfg != null && !cfg.isEmpty()) {
+                    parseConfig(cfg);
+                    return;
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        // 2. Из файла конфигурации
+        File f = new File("/data/user_de/0/com.android.systemui/lockcenter.conf");
+        if (!f.exists()) f = new File("/data/data/com.android.systemui/lockcenter.conf");
+        if (f.exists() && f.canRead()) {
+            try (BufferedReader reader = new BufferedReader(new FileReader(f))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    String[] parts = line.split("=");
+                    if (parts.length == 2) {
+                        applyKeyValue(parts[0].trim(), parts[1].trim());
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
     }
 
     private static void parseConfig(String cfg) {
-        String[] pairs = cfg.split(";");
+        String[] pairs = cfg.contains(",") ? cfg.split(",") : cfg.split(";");
         for (String pair : pairs) {
             String[] kv = pair.split("=");
             if (kv.length == 2) {
-                String k = kv[0].trim();
-                String v = kv[1].trim();
-                try {
-                    if ("clock_scale_x".equals(k)) clockScaleX = Float.parseFloat(v);
-                    else if ("clock_scale_y".equals(k)) clockScaleY = Float.parseFloat(v);
-                    else if ("date_extra_gap_px".equals(k)) dateExtraGapPx = Integer.parseInt(v);
-                    else if ("date_scale_x".equals(k)) dateScaleX = Float.parseFloat(v);
-                    else if ("date_scale_y".equals(k)) dateScaleY = Float.parseFloat(v);
-                    else if ("large_clock_scale_x".equals(k)) largeClockScaleX = Float.parseFloat(v);
-                    else if ("large_clock_scale_y".equals(k)) largeClockScaleY = Float.parseFloat(v);
-                    else if ("card_top_margin_px".equals(k)) cardTopMarginPx = Integer.parseInt(v);
-                    else if ("notif_top_margin_px".equals(k)) notifTopMarginPx = Integer.parseInt(v);
-                } catch (Throwable ignored) {}
+                applyKeyValue(kv[0].trim(), kv[1].trim());
             }
         }
+    }
+
+    private static void applyKeyValue(String k, String v) {
+        try {
+            if ("clock_scale_x".equals(k)) clockScaleX = Float.parseFloat(v);
+            else if ("clock_scale_y".equals(k)) clockScaleY = Float.parseFloat(v);
+            else if ("date_extra_gap_px".equals(k)) dateExtraGapPx = Integer.parseInt(v);
+            else if ("date_scale_x".equals(k)) dateScaleX = Float.parseFloat(v);
+            else if ("date_scale_y".equals(k)) dateScaleY = Float.parseFloat(v);
+            else if ("large_clock_scale_x".equals(k)) largeClockScaleX = Float.parseFloat(v);
+            else if ("large_clock_scale_y".equals(k)) largeClockScaleY = Float.parseFloat(v);
+            else if ("card_top_margin_px".equals(k)) cardTopMarginPx = Integer.parseInt(v);
+            else if ("notif_top_margin_px".equals(k)) notifTopMarginPx = Integer.parseInt(v);
+        } catch (Throwable ignored) {}
     }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
         ClassLoader cl = lpparam.classLoader;
+
+        loadConfig(null);
 
         try {
             hookKeyguard(cl);
@@ -232,7 +257,7 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-    /** На AOD дата следует синхронно за смещением часов вниз */
+    /** Контроль вертикального сдвига даты */
     private static void hookDateTranslationY(ClassLoader cl) {
         Class<?> viewClass = XposedHelpers.findClass("android.view.View", cl);
         XposedBridge.hookAllMethods(viewClass, "setTranslationY", new XC_MethodHook() {
@@ -245,10 +270,14 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (parent == null || !parent.getClass().getName().endsWith(ROOT_SUFFIX)) return;
 
                 ViewGroup root = (ViewGroup) parent;
-                View clock = findSmallClock(root);
-                float clockTy = clock != null ? clock.getTranslationY() : 0f;
+                View smallClock = findSmallClock(root);
 
-                param.args[0] = clockTy + (float) dateExtraGapPx;
+                // Если активны маленькие часы (есть уведомления)
+                if (smallClock != null && smallClock.getVisibility() == View.VISIBLE && smallClock.getAlpha() > 0.05f) {
+                    float clockTy = smallClock.getTranslationY();
+                    param.args[0] = clockTy + (float) dateExtraGapPx;
+                }
+                // В режиме больших часов не сбиваем дату вверх
             }
         });
     }
@@ -279,7 +308,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     final ViewGroup root = (ViewGroup) param.thisObject;
-                    loadConfigFromSystem(root.getContext());
+                    loadConfig(root.getContext());
                     registerReceiverIfNeeded(root.getContext());
                     if (!HOOKED.add(root)) return;
                     root.getViewTreeObserver().addOnPreDrawListener(
@@ -290,7 +319,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                         long now = System.currentTimeMillis();
                                         if (now - lastCheckTime > 2000) {
                                             lastCheckTime = now;
-                                            loadConfigFromSystem(root.getContext());
+                                            loadConfig(root.getContext());
                                         }
 
                                         fixKeyguard(root, false);
@@ -323,6 +352,8 @@ public class MainHook implements IXposedHookLoadPackage {
             attachLargeClockScaler(largeClock);
         }
 
+        boolean isSmallClockActive = (clock != null && clock.getVisibility() == View.VISIBLE && clock.getAlpha() > 0.05f);
+
         if (clock != null) {
             if (clock.getId() == View.NO_ID) {
                 clock.setId(View.generateViewId());
@@ -332,43 +363,46 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         // 1. ДАТА (Чт, 8 окт.)
-        if (dateView != null && clock != null) {
+        if (dateView != null) {
             attachDateScaler(dateView);
 
             if (dateView.getId() == View.NO_ID) {
                 dateView.setId(View.generateViewId());
             }
 
-            ViewGroup.LayoutParams lp = dateView.getLayoutParams();
-            if (lp != null) {
-                int cid = clock.getId();
+            // Корректируем разметку даты только когда активны маленькие часы
+            if (isSmallClockActive && clock != null) {
+                ViewGroup.LayoutParams lp = dateView.getLayoutParams();
+                if (lp != null) {
+                    int cid = clock.getId();
 
-                setInt(lp, "baselineToBaseline", UNSET);
-                setInt(lp, "baselineToTop", UNSET);
-                setInt(lp, "baselineToBottom", UNSET);
+                    setInt(lp, "baselineToBaseline", UNSET);
+                    setInt(lp, "baselineToTop", UNSET);
+                    setInt(lp, "baselineToBottom", UNSET);
 
-                setInt(lp, "startToEnd", UNSET);
-                setInt(lp, "leftToRight", UNSET);
-                setInt(lp, "topToTop", UNSET);
-                setInt(lp, "bottomToTop", UNSET);
-                setInt(lp, "bottomToBottom", UNSET);
+                    setInt(lp, "startToEnd", UNSET);
+                    setInt(lp, "leftToRight", UNSET);
+                    setInt(lp, "topToTop", UNSET);
+                    setInt(lp, "bottomToTop", UNSET);
+                    setInt(lp, "bottomToBottom", UNSET);
 
-                setInt(lp, "topToBottom", cid);
+                    setInt(lp, "topToBottom", cid);
 
-                setInt(lp, "startToStart", PARENT);
-                setInt(lp, "endToEnd", PARENT);
-                setFloat(lp, "horizontalBias", 0.5f);
+                    setInt(lp, "startToStart", PARENT);
+                    setInt(lp, "endToEnd", PARENT);
+                    setFloat(lp, "horizontalBias", 0.5f);
 
-                if (lp instanceof ViewGroup.MarginLayoutParams) {
-                    ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-                    m.setMarginStart(0);
-                    m.setMarginEnd(0);
-                    m.leftMargin = 0;
-                    m.rightMargin = 0;
-                    m.topMargin = 20;
+                    if (lp instanceof ViewGroup.MarginLayoutParams) {
+                        ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
+                        m.setMarginStart(0);
+                        m.setMarginEnd(0);
+                        m.leftMargin = 0;
+                        m.rightMargin = 0;
+                        m.topMargin = 20;
+                    }
+
+                    apply(dateView, lp, root, inMeasure);
                 }
-
-                apply(dateView, lp, root, inMeasure);
             }
         }
 
@@ -379,7 +413,7 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             ViewGroup.LayoutParams lp = cardView.getLayoutParams();
-            if (lp != null) {
+            if (lp != null && isSmallClockActive) {
                 int did = dateView.getId();
 
                 setInt(lp, "baselineToBaseline", UNSET);
@@ -394,23 +428,25 @@ public class MainHook implements IXposedHookLoadPackage {
 
                 if (lp instanceof ViewGroup.MarginLayoutParams) {
                     ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-                    m.topMargin = 12;
+                    m.topMargin = 12 + cardTopMarginPx; // Отступ фонарика из настроек
                 }
 
                 apply(cardView, lp, root, inMeasure);
             }
         }
 
-        // 3. Точка привязки уведомлений
-        int anchorId = View.NO_ID;
-        if (cardView != null && cardView.getVisibility() == View.VISIBLE && cardView.getHeight() > 0) {
-            anchorId = cardView.getId();
-        } else if (dateView != null) {
-            anchorId = dateView.getId();
-        }
+        // 3. Точка привязки уведомлений (с регулируемым отступом)
+        if (isSmallClockActive) {
+            int anchorId = View.NO_ID;
+            if (cardView != null && cardView.getVisibility() == View.VISIBLE && cardView.getHeight() > 0) {
+                anchorId = cardView.getId();
+            } else if (dateView != null) {
+                anchorId = dateView.getId();
+            }
 
-        if (anchorId != View.NO_ID) {
-            pointPlaceholderAt(root, anchorId, inMeasure);
+            if (anchorId != View.NO_ID) {
+                pointPlaceholderAt(root, anchorId, inMeasure);
+            }
         }
     }
 
@@ -424,16 +460,19 @@ public class MainHook implements IXposedHookLoadPackage {
         View clock = null;
         View dateView = null;
         View cardView = null;
+        View largeClock = null;
 
         for (int i = 0; i < root.getChildCount(); i++) {
             View v = root.getChildAt(i);
             if (v.getVisibility() != View.VISIBLE) continue;
 
-            if (v.getClass().getName().endsWith(CLOCK_SUFFIX)) clock = v;
+            String n = v.getClass().getName();
+            if (n.endsWith(CLOCK_SUFFIX)) clock = v;
+            else if (n.endsWith(LARGE_CLOCK_SUFFIX)) largeClock = v;
             else if (isDateOnly(v)) dateView = v;
             else if (isSmartspaceCard(v)) cardView = v;
 
-            if (isDateOnly(v) || v.getClass().getName().endsWith(CLOCK_SUFFIX)) {
+            if (isDateOnly(v) || n.endsWith(CLOCK_SUFFIX)) {
                 int w = v.getWidth();
                 if (w > 0 && w < displayWidth - 100) {
                     int left = v.getLeft();
@@ -446,33 +485,47 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
 
-        // Смещение часов на AOD
-        float clockTy = clock != null ? clock.getTranslationY() : 0f;
+        boolean isSmallClockActive = (clock != null && clock.getVisibility() == View.VISIBLE && clock.getAlpha() > 0.05f);
 
-        // Дата ВСЕГДА следует за смещением часов вниз (на экране и в AOD)
-        if (dateView != null && dateView.getVisibility() == View.VISIBLE) {
-            float desiredDateTy = clockTy + (float) dateExtraGapPx;
-            if (Math.abs(dateView.getTranslationY() - desiredDateTy) > 0.5f) {
-                dateView.setTranslationY(desiredDateTy);
+        if (isSmallClockActive) {
+            // --- РЕЖИМ МАЛЕНЬКИХ ЧАСОВ (уведомления есть) ---
+            float clockTy = clock.getTranslationY();
+
+            if (dateView != null && dateView.getVisibility() == View.VISIBLE) {
+                float desiredDateTy = clockTy + (float) dateExtraGapPx;
+                if (Math.abs(dateView.getTranslationY() - desiredDateTy) > 0.5f) {
+                    dateView.setTranslationY(desiredDateTy);
+                }
             }
-        }
 
-        // Карточка фонарика следует за датой
-        if (cardView != null && cardView.getVisibility() == View.VISIBLE) {
-            float desiredCardTy = clockTy + (float) (dateExtraGapPx + cardTopMarginPx);
-            if (Math.abs(cardView.getTranslationY() - desiredCardTy) > 0.5f) {
-                cardView.setTranslationY(desiredCardTy);
+            if (cardView != null && cardView.getVisibility() == View.VISIBLE) {
+                float desiredCardTy = clockTy + (float) (dateExtraGapPx + cardTopMarginPx);
+                if (Math.abs(cardView.getTranslationY() - desiredCardTy) > 0.5f) {
+                    cardView.setTranslationY(desiredCardTy);
+                }
             }
-        }
 
-        // Уведомления следуют вниз за всем блоком
-        if (placeholderId != 0) {
-            View ph = root.findViewById(placeholderId);
-            if (ph != null) {
-                float baseOffset = clockTy + dateExtraGapPx + (cardView != null && cardView.getVisibility() == View.VISIBLE ? cardTopMarginPx : 0);
-                float desiredPhTy = baseOffset + notifTopMarginPx;
-                if (Math.abs(ph.getTranslationY() - desiredPhTy) > 0.5f) {
-                    ph.setTranslationY(desiredPhTy);
+            if (placeholderId != 0) {
+                View ph = root.findViewById(placeholderId);
+                if (ph != null) {
+                    float baseOffset = clockTy + dateExtraGapPx + (cardView != null && cardView.getVisibility() == View.VISIBLE ? cardTopMarginPx : 0);
+                    float desiredPhTy = baseOffset + notifTopMarginPx;
+                    if (Math.abs(ph.getTranslationY() - desiredPhTy) > 0.5f) {
+                        ph.setTranslationY(desiredPhTy);
+                    }
+                }
+            }
+        } else {
+            // --- РЕЖИМ БОЛЬШИХ ЧАСОВ (уведомлений нет) ---
+            // Дата не смещается вверх на -20px. Если большие часы увеличены — дата отодвигается вниз.
+            if (dateView != null && dateView.getVisibility() == View.VISIBLE) {
+                float desiredDateTy = 0f;
+                if (largeClock != null && largeClock.getVisibility() == View.VISIBLE && largeClock.getHeight() > 0) {
+                    float largeExpandDown = (largeClock.getHeight() * (largeClockScaleY - 1f)) / 2f;
+                    desiredDateTy = largeClock.getTranslationY() + Math.max(0f, largeExpandDown) + 20f;
+                }
+                if (Math.abs(dateView.getTranslationY() - desiredDateTy) > 0.5f) {
+                    dateView.setTranslationY(desiredDateTy);
                 }
             }
         }
@@ -575,6 +628,10 @@ public class MainHook implements IXposedHookLoadPackage {
         if (ph == null || ph.getLayoutParams() == null) return;
         ViewGroup.LayoutParams lp = ph.getLayoutParams();
         setInt(lp, "topToBottom", anchorId);
+        if (lp instanceof ViewGroup.MarginLayoutParams) {
+            ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
+            m.topMargin = notifTopMarginPx; // Отступ уведомлений из настроек
+        }
         apply(ph, lp, root, inMeasure);
     }
 
