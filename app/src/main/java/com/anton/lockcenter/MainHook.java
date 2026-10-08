@@ -37,7 +37,7 @@ public class MainHook implements IXposedHookLoadPackage {
     // Хочешь шире или уже: поставь своё число (1.0 = как было).
     private static final float LARGE_CLOCK_SCALE_X = 1.30f;
     // Высота больших часов (1.0 = как было, без изменений). Например 1.1 = на 10% выше.
-    private static final float LARGE_CLOCK_SCALE_Y = 1.00f;
+    private static final float LARGE_CLOCK_SCALE_Y = 1.10f;
     // ==================================================================================
 
     // ======== ОТСТУП КАРТОЧКИ («Фонарик включен» и т.п.) ОТ ДАТЫ, px ========
