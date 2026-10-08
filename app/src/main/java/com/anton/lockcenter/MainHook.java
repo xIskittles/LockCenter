@@ -1,9 +1,14 @@
 package com.anton.lockcenter;
 
-import android.content.Context;
-import android.content.res.Resources;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.TextView;
+
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.List;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -11,195 +16,149 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
+/**
+ * SCOUT v2: moves NOTHING. Every 3 seconds it looks at everything visible in
+ * SystemUI windows and writes the structure to the LSPosed log, but only when
+ * the structure changed. In addition to v1 it logs, for every view:
+ * layout params (size, gravity) and, inside ConstraintLayout, the exact
+ * constraints (what each view is attached to). No notification text is
+ * logged, only text length.
+ */
 public class MainHook implements IXposedHookLoadPackage {
-    private static final String TAG = "[LockCenter] ";
 
-    // Константы androidx.constraintlayout.widget.ConstraintSet
-    private static final int PARENT_ID = 0;
-    private static final int TOP = 3;
-    private static final int BOTTOM = 4;
-    private static final int START = 6;
-    private static final int END = 7;
+    private static final String[] CONSTRAINT_FIELDS = {
+            "leftToLeft", "leftToRight", "rightToLeft", "rightToRight",
+            "topToTop", "topToBottom", "bottomToTop", "bottomToBottom",
+            "baselineToBaseline",
+            "startToEnd", "startToStart", "endToStart", "endToEnd"
+    };
 
-    private static void log(String msg) {
-        XposedBridge.log(TAG + msg);
-    }
+    private static final List<WeakReference<View>> ROOTS = new ArrayList<>();
+    private static String lastKey = "";
+    private static int logged = 0;
 
     @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        if (!"com.android.systemui".equals(lpparam.packageName)) {
-            return;
-        }
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+        if (!"com.android.systemui".equals(lpparam.packageName)) return;
+        XposedBridge.log("[LockCenter] scout v2 started");
 
-        log("LockCenter v3: перехват разметки часов, даты и уведомлений...");
-        ClassLoader cl = lpparam.classLoader;
-
-        // 1. Хукаем ConstraintSet.applyTo в KeyguardRootView
         try {
-            Class<?> constraintSetClass = XposedHelpers.findClassIfExists(
-                "androidx.constraintlayout.widget.ConstraintSet", cl);
-            Class<?> keyguardRootViewClass = XposedHelpers.findClassIfExists(
-                "com.android.systemui.keyguard.ui.view.KeyguardRootView", cl);
-
-            if (constraintSetClass != null && keyguardRootViewClass != null) {
-                XposedBridge.hookAllMethods(constraintSetClass, "applyTo", new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        if (param.args.length > 0 && param.args[0] != null &&
-                            keyguardRootViewClass.isInstance(param.args[0])) {
-
-                            Object cs = param.thisObject;
-                            View root = (View) param.args[0];
-                            rebuildKeyguardConstraints(cs, root);
-                        }
-                    }
-                });
-                log("Хук ConstraintSet.applyTo активен.");
-            }
-        } catch (Throwable t) {
-            log("Ошибка ConstraintSet: " + t);
-        }
-
-        // 2. Блокируем сдвиг часов влево на уровне FlexClockViewGroup
-        try {
-            Class<?> flexClockClass = XposedHelpers.findClassIfExists(
-                "com.android.systemui.shared.clocks.view.FlexClockViewGroup", cl);
-            if (flexClockClass != null) {
-                XposedBridge.hookAllMethods(flexClockClass, "onMeasure", new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        View v = (View) param.thisObject;
-                        applyCenterPosition(v);
-                    }
-                });
-            }
-        } catch (Throwable ignored) {}
-
-        // 3. Отслеживание перемещения полки иконок уведомлений и Smartspace
-        try {
-            Class<?> viewClass = XposedHelpers.findClass("android.view.View", cl);
-            XposedBridge.hookAllMethods(viewClass, "layout", new XC_MethodHook() {
+            Class<?> vri = XposedHelpers.findClass("android.view.ViewRootImpl", lpparam.classLoader);
+            XposedBridge.hookAllMethods(vri, "setView", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    View v = (View) param.thisObject;
-                    String cls = v.getClass().getName();
-                    if (cls.contains("BcSmartspaceView") || 
-                        cls.contains("FlexClockViewGroup") || 
-                        cls.contains("NotificationIconContainer") ||
-                        cls.contains("NotificationShelf")) {
-                        applyCenterPosition(v);
+                    if (param.args.length > 0 && param.args[0] instanceof View) {
+                        ROOTS.add(new WeakReference<>((View) param.args[0]));
                     }
                 }
             });
-        } catch (Throwable ignored) {}
-    }
-
-    private static void rebuildKeyguardConstraints(Object cs, View root) {
-        Context context = root.getContext();
-        Resources res = context.getResources();
-
-        int smallClockId = getResId(res, "small_clock_view");
-        int lockscreenClockId = getResId(res, "lockscreen_clock_view");
-        int clockId = smallClockId > 0 ? smallClockId : lockscreenClockId;
-
-        int smartspaceId = getResId(res, "bc_smartspace_view");
-        if (smartspaceId == 0) smartspaceId = getResId(res, "date_smartspace_view");
-
-        int aodIconsId = getResId(res, "aod_notification_icon_container");
-        int shelfId = getResId(res, "notification_shelf");
-
-        // --- 1. ЦЕНТРИРУЕМ ЧАСЫ ---
-        if (clockId > 0) {
-            try {
-                clearHorizontal(cs, clockId);
-                // Привязываем строго между левым и правым краем экрана
-                XposedHelpers.callMethod(cs, "connect", clockId, START, PARENT_ID, START);
-                XposedHelpers.callMethod(cs, "connect", clockId, END, PARENT_ID, END);
-                XposedHelpers.callMethod(cs, "setHorizontalBias", clockId, 0.5f);
-            } catch (Throwable t) {
-                log("Ошибка центрирования часов: " + t);
-            }
+        } catch (Throwable t) {
+            XposedBridge.log(t);
         }
 
-        // --- 2. ЦЕНТРИРУЕМ ДАТУ (SMARTSPACE) СТРОГО ПОД ЧАСАМИ ---
-        if (smartspaceId > 0) {
-            try {
-                clearHorizontal(cs, smartspaceId);
-                // Отвязываем дату от правого края часов и центрируем
-                XposedHelpers.callMethod(cs, "connect", smartspaceId, START, PARENT_ID, START);
-                XposedHelpers.callMethod(cs, "connect", smartspaceId, END, PARENT_ID, END);
-                XposedHelpers.callMethod(cs, "setHorizontalBias", smartspaceId, 0.5f);
+        final Handler handler = new Handler(Looper.getMainLooper());
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                dump();
+                handler.postDelayed(this, 3000);
+            }
+        }, 10000);
+    }
 
-                // Если есть часы — ставим дату ПОД ними
-                if (clockId > 0) {
-                    XposedHelpers.callMethod(cs, "connect", smartspaceId, TOP, clockId, BOTTOM);
+    private static void dump() {
+        try {
+            if (logged > 9000) return;
+            StringBuilder full = new StringBuilder();
+            StringBuilder key = new StringBuilder();
+            for (WeakReference<View> ref : ROOTS) {
+                View v = ref.get();
+                if (v != null && v.isAttachedToWindow()) {
+                    String head = "ROOT " + v.getClass().getName() + "\n";
+                    full.append(head);
+                    key.append(head);
+                    walk(v, 0, full, key);
                 }
-            } catch (Throwable t) {
-                log("Ошибка центрирования даты: " + t);
+            }
+            String k = key.toString();
+            if (k.equals(lastKey)) return;
+            lastKey = k;
+            String[] lines = full.toString().split("\n");
+            XposedBridge.log("[LockCenter] ===== DUMP " + System.currentTimeMillis() + " =====");
+            for (String s : lines) {
+                XposedBridge.log("[LockCenter] " + s);
+            }
+            logged += lines.length;
+        } catch (Throwable t) {
+            XposedBridge.log(t);
+        }
+    }
+
+    private static String idName(View v, int id) {
+        try {
+            return v.getResources().getResourceEntryName(id);
+        } catch (Throwable t) {
+            return "#" + id;
+        }
+    }
+
+    private static void walk(View v, int depth, StringBuilder full, StringBuilder key) {
+        if (depth > 40 || v.getVisibility() != View.VISIBLE
+                || v.getWidth() == 0 || v.getHeight() == 0) return;
+
+        StringBuilder k = new StringBuilder();
+        k.append(depth).append(' ').append(v.getClass().getName());
+        k.append(" id=").append(v.getId() != View.NO_ID ? idName(v, v.getId()) : "-");
+        k.append(" w=").append(v.getWidth()).append(" h=").append(v.getHeight());
+        if (v.getAlpha() != 1f) k.append(" alpha=").append(v.getAlpha());
+        if (v instanceof TextView) k.append(" textLen=").append(((TextView) v).getText().length());
+        appendParams(v, k);
+
+        int[] xy = new int[2];
+        v.getLocationOnScreen(xy);
+
+        key.append(k).append('\n');
+        full.append(k)
+                .append(" | x=").append(xy[0])
+                .append(" y=").append(xy[1])
+                .append(" tx=").append(v.getTranslationX())
+                .append('\n');
+
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                walk(g.getChildAt(i), depth + 1, full, key);
             }
         }
+    }
 
-        // --- 3. ЦЕНТРИРУЕМ СВЕРНУТЫЕ ИКОНКИ УВЕДОМЛЕНИЙ ---
-        int[] iconShelfIds = {aodIconsId, shelfId};
-        for (int iconId : iconShelfIds) {
-            if (iconId > 0) {
+    private static void appendParams(View v, StringBuilder sb) {
+        ViewGroup.LayoutParams lp = v.getLayoutParams();
+        if (lp == null) return;
+        Class<?> c = lp.getClass();
+        sb.append(" lp=").append(c.getName().replace("androidx.constraintlayout.widget.", "CL."));
+        sb.append(" size=").append(lp.width).append('x').append(lp.height);
+
+        if (c.getName().contains("ConstraintLayout")) {
+            for (String f : CONSTRAINT_FIELDS) {
                 try {
-                    clearHorizontal(cs, iconId);
-                    XposedHelpers.callMethod(cs, "connect", iconId, START, PARENT_ID, START);
-                    XposedHelpers.callMethod(cs, "connect", iconId, END, PARENT_ID, END);
-                    XposedHelpers.callMethod(cs, "setHorizontalBias", iconId, 0.5f);
-
-                    // Ставим иконки ПОД датой
-                    if (smartspaceId > 0) {
-                        XposedHelpers.callMethod(cs, "connect", iconId, TOP, smartspaceId, BOTTOM);
+                    int val = c.getField(f).getInt(lp);
+                    if (val != -1) {
+                        sb.append(' ').append(f).append("->")
+                                .append(val == 0 ? "PARENT" : idName(v, val));
                     }
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
             }
-        }
-    }
-
-    private static void clearHorizontal(Object cs, int viewId) {
-        try {
-            XposedHelpers.callMethod(cs, "clear", viewId, START);
-            XposedHelpers.callMethod(cs, "clear", viewId, END);
-        } catch (Throwable ignored) {}
-    }
-
-    private static void applyCenterPosition(View view) {
-        if (view == null || view.getVisibility() != View.VISIBLE) return;
-
-        // Проверяем, что вьюшка на Keyguard
-        View parent = (View) view.getParent();
-        if (parent == null) return;
-        String pName = parent.getClass().getName();
-        if (!pName.contains("KeyguardRootView") && !pName.contains("NotificationShadeWindowView")) {
-            return;
-        }
-
-        int screenWidth = view.getResources().getDisplayMetrics().widthPixels;
-        int viewWidth = view.getWidth();
-
-        // Не трогаем полноэкранные карточки раскрытых уведомлений
-        if (viewWidth <= 0 || viewWidth >= screenWidth - 80) {
-            return;
-        }
-
-        view.post(() -> {
-            int currentLeft = view.getLeft();
-            int targetLeft = (screenWidth - view.getWidth()) / 2;
-            int deltaX = targetLeft - currentLeft;
-
-            if (Math.abs(view.getTranslationX() - deltaX) > 1) {
-                view.setTranslationX(deltaX);
+            try {
+                sb.append(" hBias=").append(c.getField("horizontalBias").getFloat(lp));
+            } catch (Throwable ignored) {
             }
-        });
-    }
-
-    private static int getResId(Resources res, String name) {
-        try {
-            return res.getIdentifier(name, "id", "com.android.systemui");
-        } catch (Exception e) {
-            return 0;
+        } else {
+            try {
+                sb.append(" gravity=").append(c.getField("gravity").getInt(lp));
+            } catch (Throwable ignored) {
+            }
         }
     }
 }
