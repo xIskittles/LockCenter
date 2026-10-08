@@ -2,7 +2,9 @@ package com.anton.lockcenter;
 
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.view.ViewTreeObserver;
+import android.widget.TextView;
 
 import java.lang.reflect.Field;
 import java.util.Collections;
@@ -17,10 +19,15 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class MainHook implements IXposedHookLoadPackage {
 
-    // ======== РАЗМЕР ЧАСОВ (твои значения) ========
-    private static final float CLOCK_SCALE_X = 1.65f; // ширина
-    private static final float CLOCK_SCALE_Y = 1.40f; // высота
-    // ===============================================
+    // ======== РАЗМЕР ЧАСОВ ========
+    private static final float CLOCK_SCALE_X = 1.55f; // ширина 1.5
+    private static final float CLOCK_SCALE_Y = 1.30f; // высота 1.15
+    // ==============================
+
+    // ======== ОТСТУП КАРТОЧКИ («Фонарик включен» и т.п.) ОТ ДАТЫ, px ========
+    // 0 = сразу под рамкой даты (визуально ~50 px от текста). Увеличь, если хочешь больше воздуха.
+    private static final int CARD_TOP_MARGIN_PX = 0;
+    // ==========================================================================
 
     private static final int UNSET = -1;
     private static final int PARENT = 0;
@@ -32,30 +39,37 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String ROOT_SUFFIX = ".KeyguardRootView";
 
     private static int placeholderId = 0;
+    private static int cardId = 0;
+    private static String lastChildSig = "";
+    private static int diagLogs = 0;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
         ClassLoader cl = lpparam.classLoader;
 
+        // 1. Хук разметки экрана блокировки
         try {
             hookKeyguard(cl);
         } catch (Throwable t) {
             XposedBridge.log(t);
         }
 
+        // 2. Блокировка системного сброса TranslationX у даты (с компенсацией AOD)
         try {
             hookDateTranslation(cl);
         } catch (Throwable t) {
             XposedBridge.log(t);
         }
 
+        // 3. Блокировка 1-секундного улета даты вправо при приходе уведомления
         try {
             hookDateLayout(cl);
         } catch (Throwable t) {
             XposedBridge.log(t);
         }
 
+        // 4. Центрирование компактной иконки уведомления (Shelf) и AOD
         try {
             hookPreDraw(cl, "com.android.systemui.statusbar.NotificationShelf", true);
             hookPreDraw(cl, "com.android.systemui.statusbar.phone.NotificationIconContainer", false);
@@ -64,18 +78,39 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static boolean isDateOnly(View v) {
-        if (v == null) return false;
-        String name = v.getClass().getName();
-        return name.contains("DateSmartspaceView");
+    /** Только настоящая дата. Карточки Smartspace («Фонарик включен» и т.п.) сюда не входят. */
+    private static boolean isDateView(View v) {
+        return v != null && v.getClass().getName().endsWith(".DateSmartspaceView");
     }
 
-    private static boolean isSmartspaceCard(View v) {
-        if (v == null) return false;
-        String name = v.getClass().getName();
-        return name.contains("BcSmartspaceView");
+    /**
+     * Текст даты стоит у левого края своей рамки, а справа в рамке есть пустое место.
+     * Возвращает, на сколько px нужно сдвинуть рамку вправо (+) или влево (-),
+     * чтобы по центру экрана оказался именно текст.
+     */
+    private static float dateContentDelta(View date) {
+        if (!(date instanceof ViewGroup) || date.getWidth() <= 0) return 0f;
+        float[] b = {Float.MAX_VALUE, -Float.MAX_VALUE};
+        collectTextBounds((ViewGroup) date, 0f, b);
+        if (b[1] < b[0]) return 0f;
+        return date.getWidth() / 2f - (b[0] + b[1]) / 2f;
     }
 
+    private static void collectTextBounds(ViewGroup g, float offX, float[] b) {
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View c = g.getChildAt(i);
+            if (c.getVisibility() != View.VISIBLE || c.getWidth() == 0) continue;
+            float l = offX + c.getLeft();
+            if (c instanceof TextView) {
+                b[0] = Math.min(b[0], l);
+                b[1] = Math.max(b[1], l + c.getWidth());
+            } else if (c instanceof ViewGroup) {
+                collectTextBounds((ViewGroup) c, l, b);
+            }
+        }
+    }
+
+    /** Устраняет 1-секундный улет даты вправо при анимации прихода уведомления */
     private static void hookDateLayout(ClassLoader cl) {
         Class<?> viewClass = XposedHelpers.findClass("android.view.View", cl);
         XposedHelpers.findAndHookMethod(viewClass, "layout",
@@ -83,7 +118,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
-                        if (!isDateOnly(v)) return;
+                        if (!isDateView(v)) return;
 
                         View parent = (View) v.getParent();
                         if (parent == null || !parent.getClass().getName().endsWith(ROOT_SUFFIX)) return;
@@ -96,7 +131,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         if (width > 0 && width < screenWidth - 100) {
                             float rootShift = parent.getLeft() + parent.getTranslationX();
                             int targetCenter = (int) ((screenWidth / 2f) - rootShift);
-                            int targetLeft = targetCenter - (width / 2);
+                            int targetLeft = targetCenter - (width / 2) + Math.round(dateContentDelta(v));
 
                             param.args[0] = targetLeft;
                             param.args[2] = targetLeft + width;
@@ -111,7 +146,7 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 View v = (View) param.thisObject;
-                if (!isDateOnly(v)) return;
+                if (!isDateView(v)) return;
 
                 View parent = (View) v.getParent();
                 if (parent == null || !parent.getClass().getName().endsWith(ROOT_SUFFIX)) return;
@@ -120,10 +155,11 @@ public class MainHook implements IXposedHookLoadPackage {
                 int w = v.getWidth();
                 if (w <= 0 || w >= screenWidth - 100) return;
 
+                // Учитываем сдвиг AOD
                 float rootShift = parent.getLeft() + parent.getTranslationX();
                 float targetCenterInRoot = (screenWidth / 2f) - rootShift;
                 int currentLeft = v.getLeft();
-                float targetTx = (targetCenterInRoot - w / 2f) - currentLeft;
+                float targetTx = (targetCenterInRoot - w / 2f + dateContentDelta(v)) - currentLeft;
 
                 param.args[0] = targetTx;
             }
@@ -164,6 +200,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                     try {
                                         fixKeyguard(root, false);
                                         forceCenterDateAndClock(root);
+                                        logChildren(root);
                                     } catch (Throwable ignored) {}
                                     return true;
                                 }
@@ -175,57 +212,30 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static void fixKeyguard(ViewGroup root, boolean inMeasure) {
         View clock = null;
-        View dateView = null;
-        View cardView = null;
-
-        int dateId = resId(root, "date_smartspace_view");
-        int cardId = resId(root, "bc_smartspace_view");
-
+        View date = null;
         for (int i = 0; i < root.getChildCount(); i++) {
             View c = root.getChildAt(i);
             String n = c.getClass().getName();
-            int id = c.getId();
-
-            if (n.endsWith(CLOCK_SUFFIX) && c.getHeight() < 300) {
-                clock = c;
-            } else if (id == dateId || isDateOnly(c)) {
-                dateView = c;
-            } else if (id == cardId || isSmartspaceCard(c)) {
-                cardView = c;
-            }
+            if (n.endsWith(CLOCK_SUFFIX)) clock = c;
+            else if (isDateView(c)) date = c;
         }
 
         if (clock != null) {
-            if (clock.getId() == View.NO_ID) {
-                clock.setId(View.generateViewId());
-            }
             enforceCentered(clock, root, inMeasure);
             attachClockScaler(clock);
         }
 
-        // 1. ДАТА (Чт, 8 окт.)
-        if (dateView != null && clock != null) {
-            if (dateView.getId() == View.NO_ID) {
-                dateView.setId(View.generateViewId());
-            }
-
-            ViewGroup.LayoutParams lp = dateView.getLayoutParams();
+        if (date != null && clock != null) {
+            ViewGroup.LayoutParams lp = date.getLayoutParams();
             if (lp != null) {
                 int cid = clock.getId();
-
-                // СБРАСЫВАЕМ BASELINE (то, из-за чего дата прилипала внутрь часов)
-                setInt(lp, "baselineToBaseline", UNSET);
-                setInt(lp, "baselineToTop", UNSET);
-                setInt(lp, "baselineToBottom", UNSET);
-
                 setInt(lp, "startToEnd", UNSET);
                 setInt(lp, "leftToRight", UNSET);
                 setInt(lp, "topToTop", UNSET);
-                setInt(lp, "bottomToTop", UNSET);
-                setInt(lp, "bottomToBottom", UNSET);
 
-                // ПРИВЯЗЫВАЕМ ПОД ЧАСЫ
-                setInt(lp, "topToBottom", cid);
+                if (cid != View.NO_ID) {
+                    setInt(lp, "topToBottom", cid);
+                }
 
                 setInt(lp, "startToStart", PARENT);
                 setInt(lp, "endToEnd", PARENT);
@@ -237,55 +247,37 @@ public class MainHook implements IXposedHookLoadPackage {
                     m.setMarginEnd(0);
                     m.leftMargin = 0;
                     m.rightMargin = 0;
-                    m.topMargin = 20; // чистый отступ под увеличенными часами
+                    m.topMargin = 24; // отступ вниз, чтобы увеличенные часы не налезали на дату
                 }
 
-                apply(dateView, lp, root, inMeasure);
-            }
-        }
-
-        // 2. КАРТОЧКА ФОНАРИКА (под датой)
-        if (cardView != null && dateView != null) {
-            if (cardView.getId() == View.NO_ID) {
-                cardView.setId(View.generateViewId());
+                apply(date, lp, root, inMeasure);
             }
 
-            ViewGroup.LayoutParams lp = cardView.getLayoutParams();
-            if (lp != null) {
-                int did = dateView.getId();
-
-                setInt(lp, "baselineToBaseline", UNSET);
-                setInt(lp, "startToEnd", UNSET);
-                setInt(lp, "leftToRight", UNSET);
-                setInt(lp, "topToTop", UNSET);
-                setInt(lp, "topToBottom", did); // строго под датой
-
-                setInt(lp, "startToStart", PARENT);
-                setInt(lp, "endToEnd", PARENT);
-                setFloat(lp, "horizontalBias", 0.5f);
-
-                if (lp instanceof ViewGroup.MarginLayoutParams) {
-                    ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-                    m.topMargin = 16;
+            int anchorId = date.getId();
+            View card = findCard(root);
+            if (card != null && card.getVisibility() == View.VISIBLE
+                    && card.getId() != View.NO_ID && date.getId() != View.NO_ID) {
+                ViewGroup.LayoutParams clp = card.getLayoutParams();
+                if (clp != null && clp.getClass().getName().contains("ConstraintLayout")) {
+                    boolean ch = false;
+                    ch |= setInt(clp, "topToTop", UNSET);
+                    ch |= setInt(clp, "topToBottom", date.getId());
+                    if (clp instanceof ViewGroup.MarginLayoutParams) {
+                        ViewGroup.MarginLayoutParams cm = (ViewGroup.MarginLayoutParams) clp;
+                        if (cm.topMargin != CARD_TOP_MARGIN_PX) {
+                            cm.topMargin = CARD_TOP_MARGIN_PX;
+                            ch = true;
+                        }
+                    }
+                    if (ch) apply(card, clp, root, inMeasure);
+                    anchorId = card.getId();   // уведомления начинаются под карточкой
                 }
-
-                apply(cardView, lp, root, inMeasure);
             }
-        }
-
-        // 3. Точка привязки уведомлений (под фонариком или под датой)
-        int anchorId = View.NO_ID;
-        if (cardView != null && cardView.getVisibility() == View.VISIBLE && cardView.getHeight() > 0) {
-            anchorId = cardView.getId();
-        } else if (dateView != null) {
-            anchorId = dateView.getId();
-        }
-
-        if (anchorId != View.NO_ID) {
             pointPlaceholderAt(root, anchorId, inMeasure);
         }
     }
 
+    /** Центрирует часы и дату с компенсацией сдвига AOD */
     private static void forceCenterDateAndClock(ViewGroup root) {
         int displayWidth = root.getResources().getDisplayMetrics().widthPixels;
         if (displayWidth <= 0) return;
@@ -293,46 +285,97 @@ public class MainHook implements IXposedHookLoadPackage {
         float rootShift = root.getLeft() + root.getTranslationX();
         float targetCenterInRoot = (displayWidth / 2f) - rootShift;
 
-        View clock = null;
-        View dateView = null;
-
         for (int i = 0; i < root.getChildCount(); i++) {
             View v = root.getChildAt(i);
             if (v.getVisibility() != View.VISIBLE) continue;
 
-            if (v.getClass().getName().endsWith(CLOCK_SUFFIX) && v.getHeight() < 300) {
-                clock = v;
-            } else if (isDateOnly(v)) {
-                dateView = v;
-            }
-        }
-
-        // Центрируем часы
-        if (clock != null && clock.getWidth() > 0 && clock.getWidth() < displayWidth - 100) {
-            int left = clock.getLeft();
-            float targetTx = (targetCenterInRoot - clock.getWidth() / 2f) - left;
-            if (Math.abs(clock.getTranslationX() - targetTx) > 0.5f) {
-                clock.setTranslationX(targetTx);
-            }
-        }
-
-        // Центрируем дату и принудительно гарантируем, что она визуально НИЖЕ часов
-        if (dateView != null && dateView.getWidth() > 0 && dateView.getWidth() < displayWidth - 100) {
-            int left = dateView.getLeft();
-            float targetTx = (targetCenterInRoot - dateView.getWidth() / 2f) - left;
-            if (Math.abs(dateView.getTranslationX() - targetTx) > 0.5f) {
-                dateView.setTranslationX(targetTx);
-            }
-
-            if (clock != null && clock.getHeight() > 0) {
-                float clockBottom = clock.getTop() + clock.getTranslationY() + (clock.getHeight() * (1f + (CLOCK_SCALE_Y - 1f) / 2f));
-                float desiredTop = clockBottom + 16f;
-                float currentTop = dateView.getTop() + dateView.getTranslationY();
-                if (currentTop < desiredTop) {
-                    dateView.setTranslationY(dateView.getTranslationY() + (desiredTop - currentTop));
+            if (isDateView(v) || v.getClass().getName().endsWith(CLOCK_SUFFIX)) {
+                int w = v.getWidth();
+                if (w > 0 && w < displayWidth - 100) {
+                    int left = v.getLeft();
+                    float targetTx = (targetCenterInRoot - w / 2f
+                            + (isDateView(v) ? dateContentDelta(v) : 0f)) - left;
+                    if (Math.abs(v.getTranslationX() - targetTx) > 0.5f) {
+                        v.setTranslationX(targetTx);
+                    }
                 }
             }
         }
+    }
+
+    /** Карточка Smartspace под часами («Фонарик включен», погода и т.п.). */
+    private static View findCard(ViewGroup root) {
+        View v = null;
+        if (cardId == 0) {
+            cardId = root.getResources().getIdentifier("bc_smartspace_view", "id", "com.android.systemui");
+        }
+        if (cardId != 0) v = root.findViewById(cardId);
+        if (v == null) {
+            for (int i = 0; i < root.getChildCount(); i++) {
+                View c = root.getChildAt(i);
+                String n = c.getClass().getName();
+                if (n.contains("Smartspace") && !n.endsWith(".DateSmartspaceView")
+                        && !n.contains("Weather")) {
+                    v = c;
+                    break;
+                }
+            }
+        }
+        if (v == null) return null;
+        View top = v;
+        while (top.getParent() != root) {
+            ViewParent p = top.getParent();
+            if (!(p instanceof View)) return null;
+            top = (View) p;
+        }
+        return top;
+    }
+
+    private static String idName(View v, int id) {
+        try {
+            return v.getResources().getResourceEntryName(id);
+        } catch (Throwable t) {
+            return "#" + id;
+        }
+    }
+
+    private static String ruleOf(ViewGroup.LayoutParams lp, View v, String f) {
+        try {
+            int val = lp.getClass().getField(f).getInt(lp);
+            if (val == -1) return "";
+            return " " + f + "->" + (val == 0 ? "PARENT" : idName(v, val));
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** Диагностика: пишет в лог список видимых элементов экрана блокировки, когда он меняется. */
+    private static void logChildren(ViewGroup root) {
+        if (diagLogs >= 8) return;
+        StringBuilder sig = new StringBuilder();
+        StringBuilder full = new StringBuilder();
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View c = root.getChildAt(i);
+            if (c.getVisibility() != View.VISIBLE || c.getWidth() == 0 || c.getHeight() == 0) continue;
+            String cls = c.getClass().getName();
+            String id = c.getId() != View.NO_ID ? idName(c, c.getId()) : "-";
+            sig.append(cls).append('#').append(id).append(';');
+            full.append("\n   ").append(cls).append(" id=").append(id)
+                    .append(" [x=").append(c.getLeft()).append(" y=").append(c.getTop())
+                    .append(" ").append(c.getWidth()).append('x').append(c.getHeight()).append(']');
+            ViewGroup.LayoutParams lp = c.getLayoutParams();
+            if (lp != null && lp.getClass().getName().contains("ConstraintLayout")) {
+                full.append(ruleOf(lp, c, "topToBottom")).append(ruleOf(lp, c, "topToTop"))
+                        .append(ruleOf(lp, c, "bottomToBottom")).append(ruleOf(lp, c, "bottomToTop"))
+                        .append(ruleOf(lp, c, "startToStart")).append(ruleOf(lp, c, "startToEnd"))
+                        .append(ruleOf(lp, c, "endToEnd"));
+            }
+        }
+        String sg = sig.toString();
+        if (sg.equals(lastChildSig)) return;
+        lastChildSig = sg;
+        diagLogs++;
+        XposedBridge.log("[LockCenter] keyguard children:" + full);
     }
 
     private static void attachClockScaler(final View clock) {
@@ -373,14 +416,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static int resId(ViewGroup root, String name) {
-        try {
-            return root.getResources().getIdentifier(name, "id", "com.android.systemui");
-        } catch (Throwable t) {
-            return 0;
-        }
-    }
-
     private static void enforceCentered(View v, ViewGroup parent, boolean inMeasure) {
         ViewGroup.LayoutParams lp = v.getLayoutParams();
         if (lp == null || !lp.getClass().getName().contains("ConstraintLayout")) return;
@@ -402,6 +437,11 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static void apply(View v, ViewGroup.LayoutParams lp, ViewGroup parent, boolean inMeasure) {
         if (inMeasure) {
+            try {
+                lp.getClass().getMethod("resolveLayoutDirection", int.class)
+                        .invoke(lp, parent.getLayoutDirection());
+            } catch (Throwable ignored) {
+            }
             v.forceLayout();
         } else {
             v.setLayoutParams(lp);
@@ -445,11 +485,10 @@ public class MainHook implements IXposedHookLoadPackage {
                             @Override
                             public boolean onPreDraw() {
                                 try {
-                                    int screenWidth = v.getResources().getDisplayMetrics().widthPixels;
                                     if (isShelf) {
-                                        centerShelf((ViewGroup) v, screenWidth);
+                                        centerShelf((ViewGroup) v);
                                     } else if (isAodContainer(v)) {
-                                        centerAodIcons((ViewGroup) v, screenWidth);
+                                        centerAodIcons((ViewGroup) v);
                                     }
                                 } catch (Throwable ignored) {}
                                 return true;
@@ -470,7 +509,8 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void centerAodIcons(ViewGroup c, int screenWidth) {
+    /** Выравнивает иконки на AOD строго по физическому центру экрана */
+    private static void centerAodIcons(ViewGroup c) {
         if (c.getVisibility() != View.VISIBLE || c.getWidth() == 0) return;
 
         int displayWidth = c.getResources().getDisplayMetrics().widthPixels;
@@ -491,9 +531,9 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         if (n == 0) return;
 
-        float groupCenterOnScreen = cLoc[0] + minL + (maxR - minL) / 2f;
+        float currentCenterOnScreen = cLoc[0] + minL + (maxR - minL) / 2f;
         float targetCenter = displayWidth / 2f;
-        float shift = targetCenter - groupCenterOnScreen;
+        float shift = targetCenter - currentCenterOnScreen;
 
         if (Math.abs(shift) > 0.5f) {
             for (int i = 0; i < c.getChildCount(); i++) {
@@ -503,7 +543,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void centerShelf(ViewGroup shelf, int screenWidth) {
+    private static void centerShelf(ViewGroup shelf) {
         if (shelf.getVisibility() != View.VISIBLE || shelf.getWidth() == 0
                 || shelf.getAlpha() < 0.01f) return;
         View parent = (View) shelf.getParent();
