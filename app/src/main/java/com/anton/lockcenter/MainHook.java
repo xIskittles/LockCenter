@@ -26,7 +26,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ======== ДАТА (когда есть уведомления) ========
     // Доп. зазор между часами и датой, px. Дата реально опускается примерно на это число.
-    private static final int DATE_EXTRA_GAP_PX = 20;
+    private static final int DATE_EXTRA_GAP_PX = 25;
     // Размер даты (1.0 = как было): чуть больше, в ширину немного сильнее, чем в высоту.
     private static final float DATE_SCALE_X = 1.15f;
     private static final float DATE_SCALE_Y = 1.10f;
@@ -35,9 +35,9 @@ public class MainHook implements IXposedHookLoadPackage {
     // ======== БОЛЬШИЕ ЧАСЫ (когда уведомлений нет): растяжение по ширине и (по желанию) по высоте ========
     // По умолчанию тот же множитель, что и у маленьких часов, поэтому отступы от краёв примерно такие же.
     // Хочешь шире или уже: поставь своё число (1.0 = как было).
-    private static final float LARGE_CLOCK_SCALE_X = 1.80f;
+    private static final float LARGE_CLOCK_SCALE_X = 1.30f;
     // Высота больших часов (1.0 = как было, без изменений). Например 1.1 = на 10% выше.
-    private static final float LARGE_CLOCK_SCALE_Y = 1.50f;
+    private static final float LARGE_CLOCK_SCALE_Y = 1.00f;
     // ==================================================================================
 
     // ======== ОТСТУП КАРТОЧКИ («Фонарик включен» и т.п.) ОТ ДАТЫ, px ========
