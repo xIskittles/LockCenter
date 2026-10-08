@@ -17,7 +17,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * LockCenter v5 (Pixel 7 Pro, Android 16).
+ * LockCenter v6 (Pixel 7 Pro, Android 16).
  *
  * 1) Small clock + date: before EVERY measure pass of KeyguardRootView the module
  *    re-applies its own ConstraintLayout rules (clock centered with zero margins,
@@ -42,10 +42,11 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final Set<View> HOOKED =
             Collections.newSetFromMap(new WeakHashMap<View, Boolean>());
 
-    private static Class<?> clockClass;
-    private static Class<?> dateClass;
-    private static Class<?> keyguardRootClass;
+    private static final String CLOCK_SUFFIX = ".FlexClockTextView";
+    private static final String DATE_SUFFIX = ".DateSmartspaceView";
+    private static final String ROOT_SUFFIX = ".KeyguardRootView";
     private static int barrierId = 0;
+    private static boolean hitApply, hitMeasure, hitDraw, loggedClockLp, loggedDateLp;
 
     private static int logCount = 0;
     private static int shelfLogs = 0;
@@ -60,9 +61,9 @@ public class MainHook implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
         ClassLoader cl = lpparam.classLoader;
-        log("v5 started");
+        log("v6 started");
         try {
-            hookKeyguardMeasure(cl);
+            hookKeyguard(cl);
         } catch (Throwable t) {
             XposedBridge.log(t);
         }
@@ -76,49 +77,109 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ---------------------------------------------------------------- clock + date
 
-    private static void hookKeyguardMeasure(ClassLoader cl) {
-        clockClass = XposedHelpers.findClassIfExists(
-                "com.android.systemui.shared.clocks.view.FlexClockTextView", cl);
-        dateClass = XposedHelpers.findClassIfExists(
-                "com.google.android.systemui.smartspace.DateSmartspaceView", cl);
-        keyguardRootClass = XposedHelpers.findClassIfExists(
-                "com.android.systemui.keyguard.ui.view.KeyguardRootView", cl);
-        Class<?> constraintLayout = XposedHelpers.findClassIfExists(
-                "androidx.constraintlayout.widget.ConstraintLayout", cl);
-        log("classes: clock=" + (clockClass != null) + " date=" + (dateClass != null)
-                + " root=" + (keyguardRootClass != null)
-                + " constraintLayout=" + (constraintLayout != null));
-        if (clockClass == null || keyguardRootClass == null || constraintLayout == null) return;
-
-        XC_MethodHook hook = new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                try {
-                    if (param.thisObject != null
-                            && param.thisObject.getClass() == keyguardRootClass) {
-                        fixKeyguard((ViewGroup) param.thisObject);
-                    }
-                } catch (Throwable t) {
-                    XposedBridge.log(t);
-                }
-            }
-        };
-        int n = XposedBridge.hookAllMethods(constraintLayout, "onMeasure", hook).size();
-        n += XposedBridge.hookAllMethods(keyguardRootClass, "onMeasure", hook).size();
-        log("onMeasure hooks: " + n);
+    private static boolean isRoot(Object o) {
+        return o != null && o.getClass().getName().endsWith(ROOT_SUFFIX);
     }
 
-    private static void fixKeyguard(ViewGroup root) {
+    /** Three independent entry points; each one is safe to run repeatedly. */
+    private static void hookKeyguard(ClassLoader cl) {
+        Class<?> constraintSet = XposedHelpers.findClassIfExists(
+                "androidx.constraintlayout.widget.ConstraintSet", cl);
+        Class<?> constraintLayout = XposedHelpers.findClassIfExists(
+                "androidx.constraintlayout.widget.ConstraintLayout", cl);
+        Class<?> rootClass = XposedHelpers.findClassIfExists(
+                "com.android.systemui.keyguard.ui.view.KeyguardRootView", cl);
+        log("classes: constraintSet=" + (constraintSet != null)
+                + " constraintLayout=" + (constraintLayout != null)
+                + " root=" + (rootClass != null));
+
+        // 1) right after the system applies its constraint rules
+        if (constraintSet != null) {
+            XC_MethodHook after = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.args.length >= 1 && isRoot(param.args[0])) {
+                            if (!hitApply) { hitApply = true; log("entry applyTo fired"); }
+                            fixKeyguard((ViewGroup) param.args[0], false);
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log(t);
+                    }
+                }
+            };
+            int n = XposedBridge.hookAllMethods(constraintSet, "applyTo", after).size();
+            n += XposedBridge.hookAllMethods(constraintSet, "applyToWithoutCheck", after).size();
+            log("applyTo hooks: " + n);
+        }
+
+        // 2) before every measure pass of the keyguard root
+        if (constraintLayout != null) {
+            XC_MethodHook before = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (isRoot(param.thisObject)) {
+                            if (!hitMeasure) { hitMeasure = true; log("entry onMeasure fired"); }
+                            fixKeyguard((ViewGroup) param.thisObject, true);
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log(t);
+                    }
+                }
+            };
+            int n = XposedBridge.hookAllMethods(constraintLayout, "onMeasure", before).size();
+            if (rootClass != null) {
+                n += XposedBridge.hookAllMethods(rootClass, "onMeasure", before).size();
+            }
+            log("onMeasure hooks: " + n);
+        }
+
+        // 3) before every frame is drawn (same technique that already works for the pill)
+        if (rootClass != null) {
+            int n = XposedBridge.hookAllConstructors(rootClass, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    final ViewGroup root = (ViewGroup) param.thisObject;
+                    if (!HOOKED.add(root)) return;
+                    root.getViewTreeObserver().addOnPreDrawListener(
+                            new ViewTreeObserver.OnPreDrawListener() {
+                                @Override
+                                public boolean onPreDraw() {
+                                    try {
+                                        if (!hitDraw) { hitDraw = true; log("entry preDraw fired"); }
+                                        fixKeyguard(root, false);
+                                    } catch (Throwable t) {
+                                        XposedBridge.log(t);
+                                    }
+                                    return true;
+                                }
+                            });
+                }
+            }).size();
+            log("root constructor hooks: " + n);
+        }
+    }
+
+    private static void fixKeyguard(ViewGroup root, boolean inMeasure) {
         View clock = null;
         View date = null;
         for (int i = 0; i < root.getChildCount(); i++) {
             View c = root.getChildAt(i);
-            if (clockClass.isInstance(c)) clock = c;                       // small clock
-            else if (dateClass != null && dateClass.isInstance(c)) date = c; // date (+ alarm)
+            String n = c.getClass().getName();
+            if (n.endsWith(CLOCK_SUFFIX)) clock = c;           // small clock
+            else if (n.endsWith(DATE_SUFFIX)) date = c;        // date (+ alarm)
         }
         if (clock == null) return;
 
-        boolean a = enforceCentered(clock, root);
+        if (!loggedClockLp && clock.getLayoutParams() != null) {
+            loggedClockLp = true;
+            ViewGroup.LayoutParams l = clock.getLayoutParams();
+            log("clock lp: startToStart=" + getInt(l, "startToStart")
+                    + " endToEnd=" + getInt(l, "endToEnd")
+                    + " marginStart=" + ((ViewGroup.MarginLayoutParams) l).getMarginStart());
+        }
+        boolean a = enforceCentered(clock, root, inMeasure);
         attachClockScaler(clock);
         if (a && fixLogs++ < 10) log("small clock centered");
 
@@ -127,6 +188,12 @@ public class MainHook implements IXposedHookLoadPackage {
         int cid = clock.getId();
         if (lp == null || cid == View.NO_ID) return;
 
+        if (!loggedDateLp) {
+            loggedDateLp = true;
+            log("date lp: startToEnd=" + getInt(lp, "startToEnd")
+                    + " topToBottom=" + getInt(lp, "topToBottom")
+                    + " topToTop=" + getInt(lp, "topToTop") + " clockId=" + cid);
+        }
         boolean tiedToClock = getInt(lp, "startToEnd") == cid
                 || getInt(lp, "topToBottom") == cid
                 || getInt(lp, "topToTop") == cid;
@@ -137,15 +204,15 @@ public class MainHook implements IXposedHookLoadPackage {
         v |= setInt(lp, "bottomToTop", UNSET);
         v |= setInt(lp, "bottomToBottom", UNSET);
         v |= setInt(lp, "topToBottom", cid);
-        boolean h = enforceCentered(date, root);
-        if (v && !h) resolve(date, lp, root);
+        boolean h = enforceCentered(date, root, inMeasure);
+        if (v && !h) apply(date, lp, root, inMeasure);
         if ((v || h) && fixLogs++ < 10) log("date placed under clock and centered");
 
-        extendBarrier(root, date.getId());
+        extendBarrier(root, date.getId(), inMeasure);
     }
 
     /** Make the barrier under the clock block include the date, so notifications start below it. */
-    private static void extendBarrier(ViewGroup root, int dateId) {
+    private static void extendBarrier(ViewGroup root, int dateId, boolean inMeasure) {
         if (dateId == View.NO_ID) return;
         if (barrierId == 0) {
             barrierId = root.getResources().getIdentifier(
@@ -160,13 +227,14 @@ public class MainHook implements IXposedHookLoadPackage {
             int[] n = Arrays.copyOf(ids, ids.length + 1);
             n[ids.length] = dateId;
             XposedHelpers.callMethod(b, "setReferencedIds", (Object) n);
+            if (!inMeasure) b.requestLayout();
             if (fixLogs++ < 10) log("barrier extended with date (was " + ids.length + " ids)");
         } catch (Throwable t) {
             if (fixLogs++ < 10) log("barrier fix failed: " + t);
         }
     }
 
-    private static boolean enforceCentered(View v, ViewGroup parent) {
+    private static boolean enforceCentered(View v, ViewGroup parent, boolean inMeasure) {
         ViewGroup.LayoutParams lp = v.getLayoutParams();
         if (lp == null || !lp.getClass().getName().contains("ConstraintLayout")) return false;
         boolean ch = false;
@@ -187,8 +255,13 @@ public class MainHook implements IXposedHookLoadPackage {
                 ch = true;
             }
         }
-        if (ch) resolve(v, lp, parent);
+        if (ch) apply(v, lp, parent, inMeasure);
         return ch;
+    }
+
+    private static void apply(View v, ViewGroup.LayoutParams lp, ViewGroup parent, boolean inMeasure) {
+        if (inMeasure) resolve(v, lp, parent);   // inside onMeasure: no requestLayout
+        else v.setLayoutParams(lp);
     }
 
     /** We are inside onMeasure: re-resolve the params directly instead of calling requestLayout. */
