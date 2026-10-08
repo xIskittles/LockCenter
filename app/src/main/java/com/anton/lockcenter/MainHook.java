@@ -26,7 +26,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ======== ДАТА (когда есть уведомления) ========
     // Доп. зазор между часами и датой, px. Дата реально опускается примерно на это число.
-    private static final int DATE_EXTRA_GAP_PX = 10;
+    private static final int DATE_EXTRA_GAP_PX = 20;
     // Размер даты (1.0 = как было): чуть больше, в ширину немного сильнее, чем в высоту.
     private static final float DATE_SCALE_X = 1.15f;
     private static final float DATE_SCALE_Y = 1.10f;
