@@ -5,6 +5,7 @@ import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 
 import java.lang.reflect.Field;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Set;
 import java.util.WeakHashMap;
@@ -16,35 +17,52 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * LockCenter v4 (Pixel 7 Pro, Android 16).
- * 1) small clock + date: ConstraintLayout rules of KeyguardRootView are patched
- *    right after ConstraintSet.applyTo (clock centered, date centered UNDER the clock).
- * 2) compact notification pill on the lock screen (NotificationShelf): shifted to the center.
- * 3) notification icons on AOD (aod_notification_icon_container): shifted to the center.
- * Nothing uses a permanent hack on translationX of clock/date, so AOD burn-in shifts keep working.
+ * LockCenter v5 (Pixel 7 Pro, Android 16).
+ *
+ * 1) Small clock + date: before EVERY measure pass of KeyguardRootView the module
+ *    re-applies its own ConstraintLayout rules (clock centered with zero margins,
+ *    date centered UNDER the clock, "smart_space_barrier_bottom" extended to the
+ *    date so notifications start below it). Because it is re-applied each time,
+ *    the system cannot silently undo it.
+ * 2) Small clock size: scale factors below (width a bit more than height).
+ * 3) Compact notification pill on the lock screen (NotificationShelf): centered.
+ * 4) Notification icons on AOD (aod_notification_icon_container): centered.
  */
 public class MainHook implements IXposedHookLoadPackage {
+
+    // ======== TWEAK HERE ========
+    /** Clock size multipliers (1.0 = stock). Width is larger than height on purpose. */
+    private static final float CLOCK_SCALE_X = 1.20f;
+    private static final float CLOCK_SCALE_Y = 1.12f;
+    // ============================
 
     private static final int UNSET = -1;
     private static final int PARENT = 0;
 
     private static final Set<View> HOOKED =
             Collections.newSetFromMap(new WeakHashMap<View, Boolean>());
+
+    private static Class<?> clockClass;
+    private static Class<?> dateClass;
+    private static Class<?> keyguardRootClass;
+    private static int barrierId = 0;
+
     private static int logCount = 0;
     private static int shelfLogs = 0;
     private static int aodLogs = 0;
+    private static int fixLogs = 0;
 
     private static void log(String m) {
-        if (logCount++ < 120) XposedBridge.log("[LockCenter] " + m);
+        if (logCount++ < 150) XposedBridge.log("[LockCenter] " + m);
     }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
         ClassLoader cl = lpparam.classLoader;
-        log("v4 started");
+        log("v5 started");
         try {
-            hookConstraintSet(cl);
+            hookKeyguardMeasure(cl);
         } catch (Throwable t) {
             XposedBridge.log(t);
         }
@@ -58,31 +76,36 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ---------------------------------------------------------------- clock + date
 
-    private static void hookConstraintSet(ClassLoader cl) {
-        Class<?> cs = XposedHelpers.findClassIfExists(
-                "androidx.constraintlayout.widget.ConstraintSet", cl);
-        if (cs == null) {
-            log("ConstraintSet not found");
-            return;
-        }
+    private static void hookKeyguardMeasure(ClassLoader cl) {
+        clockClass = XposedHelpers.findClassIfExists(
+                "com.android.systemui.shared.clocks.view.FlexClockTextView", cl);
+        dateClass = XposedHelpers.findClassIfExists(
+                "com.google.android.systemui.smartspace.DateSmartspaceView", cl);
+        keyguardRootClass = XposedHelpers.findClassIfExists(
+                "com.android.systemui.keyguard.ui.view.KeyguardRootView", cl);
+        Class<?> constraintLayout = XposedHelpers.findClassIfExists(
+                "androidx.constraintlayout.widget.ConstraintLayout", cl);
+        log("classes: clock=" + (clockClass != null) + " date=" + (dateClass != null)
+                + " root=" + (keyguardRootClass != null)
+                + " constraintLayout=" + (constraintLayout != null));
+        if (clockClass == null || keyguardRootClass == null || constraintLayout == null) return;
+
         XC_MethodHook hook = new XC_MethodHook() {
             @Override
-            protected void afterHookedMethod(MethodHookParam param) {
+            protected void beforeHookedMethod(MethodHookParam param) {
                 try {
-                    if (param.args.length >= 1 && param.args[0] instanceof ViewGroup) {
-                        ViewGroup root = (ViewGroup) param.args[0];
-                        if (root.getClass().getName().endsWith("KeyguardRootView")) {
-                            fixKeyguard(root);
-                        }
+                    if (param.thisObject != null
+                            && param.thisObject.getClass() == keyguardRootClass) {
+                        fixKeyguard((ViewGroup) param.thisObject);
                     }
                 } catch (Throwable t) {
                     XposedBridge.log(t);
                 }
             }
         };
-        int n = XposedBridge.hookAllMethods(cs, "applyTo", hook).size();
-        n += XposedBridge.hookAllMethods(cs, "applyToWithoutCheck", hook).size();
-        log("ConstraintSet hooks: " + n);
+        int n = XposedBridge.hookAllMethods(constraintLayout, "onMeasure", hook).size();
+        n += XposedBridge.hookAllMethods(keyguardRootClass, "onMeasure", hook).size();
+        log("onMeasure hooks: " + n);
     }
 
     private static void fixKeyguard(ViewGroup root) {
@@ -90,33 +113,60 @@ public class MainHook implements IXposedHookLoadPackage {
         View date = null;
         for (int i = 0; i < root.getChildCount(); i++) {
             View c = root.getChildAt(i);
-            String n = c.getClass().getName();
-            if (n.endsWith(".FlexClockTextView")) clock = c;       // small clock (direct child)
-            else if (n.endsWith(".DateSmartspaceView")) date = c;  // date (+ alarm)
+            if (clockClass.isInstance(c)) clock = c;                       // small clock
+            else if (dateClass != null && dateClass.isInstance(c)) date = c; // date (+ alarm)
         }
         if (clock == null) return;
 
-        if (centerHorizontally(clock)) log("small clock centered");
+        boolean a = enforceCentered(clock, root);
+        attachClockScaler(clock);
+        if (a && fixLogs++ < 10) log("small clock centered");
 
-        if (date != null) {
-            ViewGroup.LayoutParams lp = date.getLayoutParams();
-            int cid = clock.getId();
-            if (lp != null && cid != View.NO_ID
-                    && (getInt(lp, "startToEnd") == cid
-                    || getInt(lp, "topToBottom") == cid
-                    || getInt(lp, "topToTop") == cid)) {
-                boolean v = false;
-                v |= setInt(lp, "topToTop", UNSET);
-                v |= setInt(lp, "bottomToBottom", UNSET);
-                v |= setInt(lp, "topToBottom", cid);
-                boolean h = centerHorizontally(date);
-                if (v && !h) date.setLayoutParams(lp);
-                if (v || h) log("date moved under clock and centered");
-            }
+        if (date == null) return;
+        ViewGroup.LayoutParams lp = date.getLayoutParams();
+        int cid = clock.getId();
+        if (lp == null || cid == View.NO_ID) return;
+
+        boolean tiedToClock = getInt(lp, "startToEnd") == cid
+                || getInt(lp, "topToBottom") == cid
+                || getInt(lp, "topToTop") == cid;
+        if (!tiedToClock) return;   // large clock mode: leave the date alone
+
+        boolean v = false;
+        v |= setInt(lp, "topToTop", UNSET);
+        v |= setInt(lp, "bottomToTop", UNSET);
+        v |= setInt(lp, "bottomToBottom", UNSET);
+        v |= setInt(lp, "topToBottom", cid);
+        boolean h = enforceCentered(date, root);
+        if (v && !h) resolve(date, lp, root);
+        if ((v || h) && fixLogs++ < 10) log("date placed under clock and centered");
+
+        extendBarrier(root, date.getId());
+    }
+
+    /** Make the barrier under the clock block include the date, so notifications start below it. */
+    private static void extendBarrier(ViewGroup root, int dateId) {
+        if (dateId == View.NO_ID) return;
+        if (barrierId == 0) {
+            barrierId = root.getResources().getIdentifier(
+                    "smart_space_barrier_bottom", "id", "com.android.systemui");
+        }
+        if (barrierId == 0) return;
+        View b = root.findViewById(barrierId);
+        if (b == null) return;
+        try {
+            int[] ids = (int[]) XposedHelpers.callMethod(b, "getReferencedIds");
+            for (int id : ids) if (id == dateId) return;
+            int[] n = Arrays.copyOf(ids, ids.length + 1);
+            n[ids.length] = dateId;
+            XposedHelpers.callMethod(b, "setReferencedIds", (Object) n);
+            if (fixLogs++ < 10) log("barrier extended with date (was " + ids.length + " ids)");
+        } catch (Throwable t) {
+            if (fixLogs++ < 10) log("barrier fix failed: " + t);
         }
     }
 
-    private static boolean centerHorizontally(View v) {
+    private static boolean enforceCentered(View v, ViewGroup parent) {
         ViewGroup.LayoutParams lp = v.getLayoutParams();
         if (lp == null || !lp.getClass().getName().contains("ConstraintLayout")) return false;
         boolean ch = false;
@@ -137,8 +187,23 @@ public class MainHook implements IXposedHookLoadPackage {
                 ch = true;
             }
         }
-        if (ch) v.setLayoutParams(lp);
+        if (ch) resolve(v, lp, parent);
         return ch;
+    }
+
+    /** We are inside onMeasure: re-resolve the params directly instead of calling requestLayout. */
+    private static void resolve(final View v, final ViewGroup.LayoutParams lp, ViewGroup parent) {
+        try {
+            lp.getClass().getMethod("resolveLayoutDirection", int.class)
+                    .invoke(lp, parent.getLayoutDirection());
+        } catch (Throwable t) {
+            v.post(new Runnable() {
+                @Override
+                public void run() {
+                    v.setLayoutParams(lp);
+                }
+            });
+        }
     }
 
     private static int getInt(Object lp, String name) {
@@ -169,6 +234,43 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    // ------------------------------------------------------ clock size
+
+    /**
+     * Multiplies whatever scale the system sets (burn-in, transitions) by our factor.
+     * Only touches the value when the system changed it, so it never compounds.
+     */
+    private static void attachClockScaler(final View clock) {
+        if (!HOOKED.add(clock)) return;
+        clock.getViewTreeObserver().addOnPreDrawListener(
+                new ViewTreeObserver.OnPreDrawListener() {
+                    private float lastX = Float.NaN;
+                    private float lastY = Float.NaN;
+
+                    @Override
+                    public boolean onPreDraw() {
+                        try {
+                            if (clock.getVisibility() != View.VISIBLE) return true;
+                            clock.setPivotX(clock.getWidth() / 2f);
+                            clock.setPivotY(clock.getHeight() / 2f);
+                            float cx = clock.getScaleX();
+                            if (cx != lastX) {
+                                lastX = cx * CLOCK_SCALE_X;
+                                clock.setScaleX(lastX);
+                            }
+                            float cy = clock.getScaleY();
+                            if (cy != lastY) {
+                                lastY = cy * CLOCK_SCALE_Y;
+                                clock.setScaleY(lastY);
+                            }
+                        } catch (Throwable t) {
+                            XposedBridge.log(t);
+                        }
+                        return true;
+                    }
+                });
     }
 
     // ------------------------------------------------ shelf pill + AOD icons
