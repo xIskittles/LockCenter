@@ -4,15 +4,13 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.view.ViewTreeObserver;
 import android.widget.TextView;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
 import java.lang.reflect.Field;
 import java.util.Collections;
 import java.util.Set;
@@ -20,21 +18,22 @@ import java.util.WeakHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XSharedPreferences;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class MainHook implements IXposedHookLoadPackage {
 
-    public static volatile float clockScaleX = 1.80f;
-    public static volatile float clockScaleY = 1.50f;
-    public static volatile int dateExtraGapPx = 5;
-    public static volatile float dateScaleX = 1.25f;
+    // Твои идеальные значения по умолчанию
+    public static volatile float clockScaleX = 1.60f;
+    public static volatile float clockScaleY = 1.30f;
+    public static volatile int dateExtraGapPx = -20;
+    public static volatile float dateScaleX = 1.30f;
     public static volatile float dateScaleY = 1.15f;
     public static volatile float largeClockScaleX = 1.35f;
     public static volatile float largeClockScaleY = 1.05f;
-    public static volatile int cardTopMarginPx = 0;
+    public static volatile int cardTopMarginPx = -50;
+    public static volatile int notifTopMarginPx = 0;
 
     private static final int UNSET = -1;
     private static final int PARENT = 0;
@@ -49,60 +48,45 @@ public class MainHook implements IXposedHookLoadPackage {
     private static int placeholderId = 0;
     private static int cardId = 0;
     private static boolean receiverRegistered = false;
-    private static long lastFileCheckTime = 0;
-    private static long lastFileModified = 0;
+    private static long lastCheckTime = 0;
 
-    public static void loadConfigFromFile() {
-        File f = new File("/data/user_de/0/com.android.systemui/lockcenter.conf");
-        if (!f.exists()) {
-            f = new File("/data/data/com.android.systemui/lockcenter.conf");
-        }
-        if (f.exists() && f.canRead()) {
-            long modified = f.lastModified();
-            if (modified == lastFileModified && lastFileModified != 0) return;
-            lastFileModified = modified;
-
-            try (BufferedReader reader = new BufferedReader(new FileReader(f))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    String[] parts = line.split("=");
-                    if (parts.length == 2) {
-                        String k = parts[0].trim();
-                        String v = parts[1].trim();
-                        if ("clock_scale_x".equals(k)) clockScaleX = Float.parseFloat(v);
-                        else if ("clock_scale_y".equals(k)) clockScaleY = Float.parseFloat(v);
-                        else if ("date_extra_gap_px".equals(k)) dateExtraGapPx = Integer.parseInt(v);
-                        else if ("date_scale_x".equals(k)) dateScaleX = Float.parseFloat(v);
-                        else if ("date_scale_y".equals(k)) dateScaleY = Float.parseFloat(v);
-                        else if ("large_clock_scale_x".equals(k)) largeClockScaleX = Float.parseFloat(v);
-                        else if ("large_clock_scale_y".equals(k)) largeClockScaleY = Float.parseFloat(v);
-                        else if ("card_top_margin_px".equals(k)) cardTopMarginPx = Integer.parseInt(v);
-                    }
-                }
-                return;
-            } catch (Throwable ignored) {}
-        }
-
+    /** Загрузка конфигурации из системной базы Settings.Global */
+    public static void loadConfigFromSystem(Context context) {
+        if (context == null) return;
         try {
-            XSharedPreferences prefs = new XSharedPreferences("com.anton.lockcenter", "lock_center_prefs");
-            prefs.reload();
-            clockScaleX = prefs.getFloat("clock_scale_x", clockScaleX);
-            clockScaleY = prefs.getFloat("clock_scale_y", clockScaleY);
-            dateExtraGapPx = prefs.getInt("date_extra_gap_px", dateExtraGapPx);
-            dateScaleX = prefs.getFloat("date_scale_x", dateScaleX);
-            dateScaleY = prefs.getFloat("date_scale_y", dateScaleY);
-            largeClockScaleX = prefs.getFloat("large_clock_scale_x", largeClockScaleX);
-            largeClockScaleY = prefs.getFloat("large_clock_scale_y", largeClockScaleY);
-            cardTopMarginPx = prefs.getInt("card_top_margin_px", cardTopMarginPx);
+            String cfg = Settings.Global.getString(context.getContentResolver(), "lockcenter_cfg");
+            if (cfg != null && !cfg.isEmpty()) {
+                parseConfig(cfg);
+            }
         } catch (Throwable ignored) {}
+    }
+
+    private static void parseConfig(String cfg) {
+        String[] pairs = cfg.split(";");
+        for (String pair : pairs) {
+            String[] kv = pair.split("=");
+            if (kv.length == 2) {
+                String k = kv[0].trim();
+                String v = kv[1].trim();
+                try {
+                    if ("clock_scale_x".equals(k)) clockScaleX = Float.parseFloat(v);
+                    else if ("clock_scale_y".equals(k)) clockScaleY = Float.parseFloat(v);
+                    else if ("date_extra_gap_px".equals(k)) dateExtraGapPx = Integer.parseInt(v);
+                    else if ("date_scale_x".equals(k)) dateScaleX = Float.parseFloat(v);
+                    else if ("date_scale_y".equals(k)) dateScaleY = Float.parseFloat(v);
+                    else if ("large_clock_scale_x".equals(k)) largeClockScaleX = Float.parseFloat(v);
+                    else if ("large_clock_scale_y".equals(k)) largeClockScaleY = Float.parseFloat(v);
+                    else if ("card_top_margin_px".equals(k)) cardTopMarginPx = Integer.parseInt(v);
+                    else if ("notif_top_margin_px".equals(k)) notifTopMarginPx = Integer.parseInt(v);
+                } catch (Throwable ignored) {}
+            }
+        }
     }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
         ClassLoader cl = lpparam.classLoader;
-
-        loadConfigFromFile();
 
         try {
             hookKeyguard(cl);
@@ -147,6 +131,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         largeClockScaleX = intent.getFloatExtra("large_clock_scale_x", largeClockScaleX);
                         largeClockScaleY = intent.getFloatExtra("large_clock_scale_y", largeClockScaleY);
                         cardTopMarginPx = intent.getIntExtra("card_top_margin_px", cardTopMarginPx);
+                        notifTopMarginPx = intent.getIntExtra("notif_top_margin_px", notifTopMarginPx);
                     }
                 }
             }, filter, Context.RECEIVER_EXPORTED);
@@ -238,7 +223,7 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-    /** Фиксирует отступ даты по вертикали и не даёт системе обнулять его */
+    /** Принудительно удерживает отступ даты по вертикали */
     private static void hookDateTranslationY(ClassLoader cl) {
         Class<?> viewClass = XposedHelpers.findClass("android.view.View", cl);
         XposedBridge.hookAllMethods(viewClass, "setTranslationY", new XC_MethodHook() {
@@ -281,6 +266,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     final ViewGroup root = (ViewGroup) param.thisObject;
+                    loadConfigFromSystem(root.getContext());
                     registerReceiverIfNeeded(root.getContext());
                     if (!HOOKED.add(root)) return;
                     root.getViewTreeObserver().addOnPreDrawListener(
@@ -289,9 +275,9 @@ public class MainHook implements IXposedHookLoadPackage {
                                 public boolean onPreDraw() {
                                     try {
                                         long now = System.currentTimeMillis();
-                                        if (now - lastFileCheckTime > 1500) {
-                                            lastFileCheckTime = now;
-                                            loadConfigFromFile();
+                                        if (now - lastCheckTime > 2000) {
+                                            lastCheckTime = now;
+                                            loadConfigFromSystem(root.getContext());
                                         }
 
                                         fixKeyguard(root, false);
@@ -366,7 +352,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     m.setMarginEnd(0);
                     m.leftMargin = 0;
                     m.rightMargin = 0;
-                    m.topMargin = 20 + dateExtraGapPx; // отступ из настроек
+                    m.topMargin = 20 + dateExtraGapPx;
                 }
 
                 apply(dateView, lp, root, inMeasure);
@@ -402,7 +388,7 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
 
-        // 3. Точка привязки уведомлений (под фонариком или под датой)
+        // 3. Точка привязки уведомлений (с учётом отступа из настроек)
         int anchorId = View.NO_ID;
         if (cardView != null && cardView.getVisibility() == View.VISIBLE && cardView.getHeight() > 0) {
             anchorId = cardView.getId();
@@ -445,7 +431,7 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
 
-        // Прямое смещение даты вниз на заданный зазор
+        // Смещение даты
         if (dateView != null && dateView.getVisibility() == View.VISIBLE) {
             float desiredDateTy = (float) dateExtraGapPx;
             if (Math.abs(dateView.getTranslationY() - desiredDateTy) > 0.5f) {
@@ -453,11 +439,23 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
 
-        // Смещение карточки фонарика
+        // Смещение фонарика
         if (cardView != null && cardView.getVisibility() == View.VISIBLE) {
             float desiredCardTy = (float) (dateExtraGapPx + cardTopMarginPx);
             if (Math.abs(cardView.getTranslationY() - desiredCardTy) > 0.5f) {
                 cardView.setTranslationY(desiredCardTy);
+            }
+        }
+
+        // Смещение уведомлений вниз или вверх по ползунку
+        if (placeholderId != 0) {
+            View ph = root.findViewById(placeholderId);
+            if (ph != null) {
+                float baseOffset = dateExtraGapPx + (cardView != null && cardView.getVisibility() == View.VISIBLE ? cardTopMarginPx : 0);
+                float desiredPhTy = baseOffset + notifTopMarginPx;
+                if (Math.abs(ph.getTranslationY() - desiredPhTy) > 0.5f) {
+                    ph.setTranslationY(desiredPhTy);
+                }
             }
         }
     }
@@ -558,9 +556,12 @@ public class MainHook implements IXposedHookLoadPackage {
         View ph = root.findViewById(placeholderId);
         if (ph == null || ph.getLayoutParams() == null) return;
         ViewGroup.LayoutParams lp = ph.getLayoutParams();
-        if (setInt(lp, "topToBottom", anchorId)) {
-            apply(ph, lp, root, inMeasure);
+        setInt(lp, "topToBottom", anchorId);
+        if (lp instanceof ViewGroup.MarginLayoutParams) {
+            ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
+            m.topMargin = notifTopMarginPx;
         }
+        apply(ph, lp, root, inMeasure);
     }
 
     private static void enforceCentered(View v, ViewGroup parent, boolean inMeasure) {
@@ -633,9 +634,9 @@ public class MainHook implements IXposedHookLoadPackage {
                                 try {
                                     int screenWidth = v.getResources().getDisplayMetrics().widthPixels;
                                     if (isShelf) {
-                                        centerShelf((ViewGroup) v, screenWidth);
+                                        centerShelf((ViewGroup) v);
                                     } else if (isAodContainer(v)) {
-                                        centerAodIcons((ViewGroup) v, screenWidth);
+                                        centerAodIcons((ViewGroup) v);
                                     }
                                 } catch (Throwable ignored) {}
                                 return true;
@@ -656,7 +657,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void centerAodIcons(ViewGroup c, int screenWidth) {
+    private static void centerAodIcons(ViewGroup c) {
         if (c.getVisibility() != View.VISIBLE || c.getWidth() == 0) return;
 
         int displayWidth = c.getResources().getDisplayMetrics().widthPixels;
@@ -689,7 +690,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void centerShelf(ViewGroup shelf, int screenWidth) {
+    private static void centerShelf(ViewGroup shelf) {
         if (shelf.getVisibility() != View.VISIBLE || shelf.getWidth() == 0
                 || shelf.getAlpha() < 0.01f) return;
         View parent = (View) shelf.getParent();
