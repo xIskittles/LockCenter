@@ -17,10 +17,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class MainHook implements IXposedHookLoadPackage {
 
-    // ======== РАЗМЕР ЧАСОВ ========
+    // ======== РАЗМЕР ЧАСОВ (твои настройки) ========
     private static final float CLOCK_SCALE_X = 1.65f; // ширина
     private static final float CLOCK_SCALE_Y = 1.40f; // высота
-    // ==============================
+    // ===============================================
 
     private static final int UNSET = -1;
     private static final int PARENT = 0;
@@ -45,14 +45,14 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.log(t);
         }
 
-        // 2. Блокировка системного сброса TranslationX у даты (только даты!)
+        // 2. Блокировка системного сброса TranslationX у даты
         try {
             hookDateTranslation(cl);
         } catch (Throwable t) {
             XposedBridge.log(t);
         }
 
-        // 3. Блокировка улета даты вправо при приходе уведомления
+        // 3. Блокировка 1-секундного улета даты вправо при приходе уведомления
         try {
             hookDateLayout(cl);
         } catch (Throwable t) {
@@ -68,14 +68,14 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Текст даты (Чт, 8 окт.) */
-    private static boolean isDateText(View v) {
+    /** Проверка: это сам текст даты (Чт, 8 окт.) */
+    private static boolean isDateOnly(View v) {
         if (v == null) return false;
         String name = v.getClass().getName();
-        return name.endsWith(".DateSmartspaceView");
+        return name.contains("DateSmartspaceView");
     }
 
-    /** Карточка «Самое главное» (Фонарик включен, погода, таймер) */
+    /** Проверка: это карточка «Самое главное» (Фонарик включен, таймер и т.д.) */
     private static boolean isSmartspaceCard(View v) {
         if (v == null) return false;
         String name = v.getClass().getName();
@@ -89,8 +89,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
-                        // Трогаем ТОЛЬКО текст даты, плашку фонарика не трогаем!
-                        if (!isDateText(v)) return;
+                        // Центрируем только текст даты, плашку фонарика не трогаем!
+                        if (!isDateOnly(v)) return;
 
                         View parent = (View) v.getParent();
                         if (parent == null || !parent.getClass().getName().endsWith(ROOT_SUFFIX)) return;
@@ -118,7 +118,7 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 View v = (View) param.thisObject;
-                if (!isDateText(v)) return;
+                if (!isDateOnly(v)) return;
 
                 View parent = (View) v.getParent();
                 if (parent == null || !parent.getClass().getName().endsWith(ROOT_SUFFIX)) return;
@@ -182,34 +182,47 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static void fixKeyguard(ViewGroup root, boolean inMeasure) {
         View clock = null;
-        View date = null;
-        View card = null;
+        View dateView = null;
+        View cardView = null;
+
+        int dateSmartspaceId = resId(root, "date_smartspace_view");
+        int bcSmartspaceId = resId(root, "bc_smartspace_view");
 
         for (int i = 0; i < root.getChildCount(); i++) {
             View c = root.getChildAt(i);
             String n = c.getClass().getName();
-            if (n.endsWith(CLOCK_SUFFIX) && c.getHeight() < 300) clock = c;
-            else if (isDateText(c)) date = c;
-            else if (isSmartspaceCard(c)) card = c;
+            int id = c.getId();
+
+            if (n.endsWith(CLOCK_SUFFIX) && c.getHeight() < 300) {
+                clock = c;
+            } else if (id == dateSmartspaceId || isDateOnly(c)) {
+                dateView = c;
+            } else if (id == bcSmartspaceId || isSmartspaceCard(c)) {
+                cardView = c;
+            }
         }
 
         if (clock != null) {
+            if (clock.getId() == View.NO_ID) {
+                clock.setId(View.generateViewId());
+            }
             enforceCentered(clock, root, inMeasure);
             attachClockScaler(clock);
         }
 
-        // 1. Позиционируем ДАТУ под часами по центру
-        if (date != null && clock != null) {
-            ViewGroup.LayoutParams lp = date.getLayoutParams();
+        // 1. ДАТА (Чт, 8 окт.) строго ПОД часами по центру
+        if (dateView != null && clock != null) {
+            if (dateView.getId() == View.NO_ID) {
+                dateView.setId(View.generateViewId());
+            }
+
+            ViewGroup.LayoutParams lp = dateView.getLayoutParams();
             if (lp != null) {
                 int cid = clock.getId();
                 setInt(lp, "startToEnd", UNSET);
                 setInt(lp, "leftToRight", UNSET);
                 setInt(lp, "topToTop", UNSET);
-
-                if (cid != View.NO_ID) {
-                    setInt(lp, "topToBottom", cid);
-                }
+                setInt(lp, "topToBottom", cid); // строго ПОД часами!
 
                 setInt(lp, "startToStart", PARENT);
                 setInt(lp, "endToEnd", PARENT);
@@ -221,25 +234,26 @@ public class MainHook implements IXposedHookLoadPackage {
                     m.setMarginEnd(0);
                     m.leftMargin = 0;
                     m.rightMargin = 0;
-                    m.topMargin = 16;
+                    m.topMargin = 20; // отступ вниз под большими цифрами
                 }
 
-                apply(date, lp, root, inMeasure);
+                apply(dateView, lp, root, inMeasure);
             }
         }
 
-        // 2. Позиционируем КАРТОЧКУ (Фонарик включен) под датой по центру
-        if (card != null && date != null) {
-            ViewGroup.LayoutParams lp = card.getLayoutParams();
+        // 2. КАРТОЧКА (Фонарик включен) строго ПОД датой
+        if (cardView != null && dateView != null) {
+            if (cardView.getId() == View.NO_ID) {
+                cardView.setId(View.generateViewId());
+            }
+
+            ViewGroup.LayoutParams lp = cardView.getLayoutParams();
             if (lp != null) {
-                int did = date.getId();
+                int did = dateView.getId();
                 setInt(lp, "startToEnd", UNSET);
                 setInt(lp, "leftToRight", UNSET);
                 setInt(lp, "topToTop", UNSET);
-
-                if (did != View.NO_ID) {
-                    setInt(lp, "topToBottom", did);
-                }
+                setInt(lp, "topToBottom", did); // строго ПОД датой!
 
                 setInt(lp, "startToStart", PARENT);
                 setInt(lp, "endToEnd", PARENT);
@@ -247,19 +261,19 @@ public class MainHook implements IXposedHookLoadPackage {
 
                 if (lp instanceof ViewGroup.MarginLayoutParams) {
                     ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-                    m.topMargin = 12;
+                    m.topMargin = 16;
                 }
 
-                apply(card, lp, root, inMeasure);
+                apply(cardView, lp, root, inMeasure);
             }
         }
 
-        // 3. Уведомления и значок Telegram должны начинаться НИЖЕ карточки фонарика (чтобы не перекрывать её)
+        // 3. Уведомления и полка Telegram начинаются под нижней плашкой (под фонариком или под датой)
         int anchorId = View.NO_ID;
-        if (card != null && card.getVisibility() == View.VISIBLE && card.getHeight() > 0) {
-            anchorId = card.getId();
-        } else if (date != null) {
-            anchorId = date.getId();
+        if (cardView != null && cardView.getVisibility() == View.VISIBLE && cardView.getHeight() > 0) {
+            anchorId = cardView.getId();
+        } else if (dateView != null) {
+            anchorId = dateView.getId();
         }
 
         if (anchorId != View.NO_ID) {
@@ -278,8 +292,8 @@ public class MainHook implements IXposedHookLoadPackage {
             View v = root.getChildAt(i);
             if (v.getVisibility() != View.VISIBLE) continue;
 
-            // Центрируем только часы и дату, карточку событий не сдвигаем
-            if (isDateText(v) || v.getClass().getName().endsWith(CLOCK_SUFFIX)) {
+            // Центрируем часы и только текст даты
+            if (isDateOnly(v) || v.getClass().getName().endsWith(CLOCK_SUFFIX)) {
                 int w = v.getWidth();
                 if (w > 0 && w < displayWidth - 100) {
                     int left = v.getLeft();
@@ -327,6 +341,14 @@ public class MainHook implements IXposedHookLoadPackage {
         ViewGroup.LayoutParams lp = ph.getLayoutParams();
         if (setInt(lp, "topToBottom", anchorId)) {
             apply(ph, lp, root, inMeasure);
+        }
+    }
+
+    private static int resId(ViewGroup root, String name) {
+        try {
+            return root.getResources().getIdentifier(name, "id", "com.android.systemui");
+        } catch (Throwable t) {
+            return 0;
         }
     }
 
@@ -419,6 +441,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    /** Выравнивает иконки на AOD строго по физическому центру экрана */
     private static void centerAodIcons(ViewGroup c, int screenWidth) {
         if (c.getVisibility() != View.VISIBLE || c.getWidth() == 0) return;
 
@@ -439,9 +462,9 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         if (n == 0) return;
 
-        float currentCenterOnScreen = cLoc[0] + minL + (maxR - minL) / 2f;
+        float groupCenterOnScreen = cLoc[0] + minL + (maxR - minL) / 2f;
         float targetCenter = screenWidth / 2f;
-        float shift = targetCenter - currentCenterOnScreen;
+        float shift = targetCenter - groupCenterOnScreen;
 
         if (Math.abs(shift) > 0.5f) {
             for (int i = 0; i < c.getChildCount(); i++) {
