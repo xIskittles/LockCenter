@@ -1,14 +1,13 @@
 package com.anton.lockcenter;
 
-import android.os.Handler;
-import android.os.Looper;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.TextView;
+import android.view.ViewTreeObserver;
 
-import java.lang.ref.WeakReference;
-import java.util.ArrayList;
-import java.util.List;
+import java.lang.reflect.Field;
+import java.util.Collections;
+import java.util.Set;
+import java.util.WeakHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -17,148 +16,284 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * SCOUT v2: moves NOTHING. Every 3 seconds it looks at everything visible in
- * SystemUI windows and writes the structure to the LSPosed log, but only when
- * the structure changed. In addition to v1 it logs, for every view:
- * layout params (size, gravity) and, inside ConstraintLayout, the exact
- * constraints (what each view is attached to). No notification text is
- * logged, only text length.
+ * LockCenter v4 (Pixel 7 Pro, Android 16).
+ * 1) small clock + date: ConstraintLayout rules of KeyguardRootView are patched
+ *    right after ConstraintSet.applyTo (clock centered, date centered UNDER the clock).
+ * 2) compact notification pill on the lock screen (NotificationShelf): shifted to the center.
+ * 3) notification icons on AOD (aod_notification_icon_container): shifted to the center.
+ * Nothing uses a permanent hack on translationX of clock/date, so AOD burn-in shifts keep working.
  */
 public class MainHook implements IXposedHookLoadPackage {
 
-    private static final String[] CONSTRAINT_FIELDS = {
-            "leftToLeft", "leftToRight", "rightToLeft", "rightToRight",
-            "topToTop", "topToBottom", "bottomToTop", "bottomToBottom",
-            "baselineToBaseline",
-            "startToEnd", "startToStart", "endToStart", "endToEnd"
-    };
+    private static final int UNSET = -1;
+    private static final int PARENT = 0;
 
-    private static final List<WeakReference<View>> ROOTS = new ArrayList<>();
-    private static String lastKey = "";
-    private static int logged = 0;
+    private static final Set<View> HOOKED =
+            Collections.newSetFromMap(new WeakHashMap<View, Boolean>());
+    private static int logCount = 0;
+    private static int shelfLogs = 0;
+    private static int aodLogs = 0;
+
+    private static void log(String m) {
+        if (logCount++ < 120) XposedBridge.log("[LockCenter] " + m);
+    }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
-        XposedBridge.log("[LockCenter] scout v2 started");
-
+        ClassLoader cl = lpparam.classLoader;
+        log("v4 started");
         try {
-            Class<?> vri = XposedHelpers.findClass("android.view.ViewRootImpl", lpparam.classLoader);
-            XposedBridge.hookAllMethods(vri, "setView", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    if (param.args.length > 0 && param.args[0] instanceof View) {
-                        ROOTS.add(new WeakReference<>((View) param.args[0]));
-                    }
-                }
-            });
+            hookConstraintSet(cl);
         } catch (Throwable t) {
             XposedBridge.log(t);
         }
+        try {
+            hookPreDraw(cl, "com.android.systemui.statusbar.NotificationShelf", true);
+            hookPreDraw(cl, "com.android.systemui.statusbar.phone.NotificationIconContainer", false);
+        } catch (Throwable t) {
+            XposedBridge.log(t);
+        }
+    }
 
-        final Handler handler = new Handler(Looper.getMainLooper());
-        handler.postDelayed(new Runnable() {
+    // ---------------------------------------------------------------- clock + date
+
+    private static void hookConstraintSet(ClassLoader cl) {
+        Class<?> cs = XposedHelpers.findClassIfExists(
+                "androidx.constraintlayout.widget.ConstraintSet", cl);
+        if (cs == null) {
+            log("ConstraintSet not found");
+            return;
+        }
+        XC_MethodHook hook = new XC_MethodHook() {
             @Override
-            public void run() {
-                dump();
-                handler.postDelayed(this, 3000);
-            }
-        }, 10000);
-    }
-
-    private static void dump() {
-        try {
-            if (logged > 9000) return;
-            StringBuilder full = new StringBuilder();
-            StringBuilder key = new StringBuilder();
-            for (WeakReference<View> ref : ROOTS) {
-                View v = ref.get();
-                if (v != null && v.isAttachedToWindow()) {
-                    String head = "ROOT " + v.getClass().getName() + "\n";
-                    full.append(head);
-                    key.append(head);
-                    walk(v, 0, full, key);
-                }
-            }
-            String k = key.toString();
-            if (k.equals(lastKey)) return;
-            lastKey = k;
-            String[] lines = full.toString().split("\n");
-            XposedBridge.log("[LockCenter] ===== DUMP " + System.currentTimeMillis() + " =====");
-            for (String s : lines) {
-                XposedBridge.log("[LockCenter] " + s);
-            }
-            logged += lines.length;
-        } catch (Throwable t) {
-            XposedBridge.log(t);
-        }
-    }
-
-    private static String idName(View v, int id) {
-        try {
-            return v.getResources().getResourceEntryName(id);
-        } catch (Throwable t) {
-            return "#" + id;
-        }
-    }
-
-    private static void walk(View v, int depth, StringBuilder full, StringBuilder key) {
-        if (depth > 40 || v.getVisibility() != View.VISIBLE
-                || v.getWidth() == 0 || v.getHeight() == 0) return;
-
-        StringBuilder k = new StringBuilder();
-        k.append(depth).append(' ').append(v.getClass().getName());
-        k.append(" id=").append(v.getId() != View.NO_ID ? idName(v, v.getId()) : "-");
-        k.append(" w=").append(v.getWidth()).append(" h=").append(v.getHeight());
-        if (v.getAlpha() != 1f) k.append(" alpha=").append(v.getAlpha());
-        if (v instanceof TextView) k.append(" textLen=").append(((TextView) v).getText().length());
-        appendParams(v, k);
-
-        int[] xy = new int[2];
-        v.getLocationOnScreen(xy);
-
-        key.append(k).append('\n');
-        full.append(k)
-                .append(" | x=").append(xy[0])
-                .append(" y=").append(xy[1])
-                .append(" tx=").append(v.getTranslationX())
-                .append('\n');
-
-        if (v instanceof ViewGroup) {
-            ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); i++) {
-                walk(g.getChildAt(i), depth + 1, full, key);
-            }
-        }
-    }
-
-    private static void appendParams(View v, StringBuilder sb) {
-        ViewGroup.LayoutParams lp = v.getLayoutParams();
-        if (lp == null) return;
-        Class<?> c = lp.getClass();
-        sb.append(" lp=").append(c.getName().replace("androidx.constraintlayout.widget.", "CL."));
-        sb.append(" size=").append(lp.width).append('x').append(lp.height);
-
-        if (c.getName().contains("ConstraintLayout")) {
-            for (String f : CONSTRAINT_FIELDS) {
+            protected void afterHookedMethod(MethodHookParam param) {
                 try {
-                    int val = c.getField(f).getInt(lp);
-                    if (val != -1) {
-                        sb.append(' ').append(f).append("->")
-                                .append(val == 0 ? "PARENT" : idName(v, val));
+                    if (param.args.length >= 1 && param.args[0] instanceof ViewGroup) {
+                        ViewGroup root = (ViewGroup) param.args[0];
+                        if (root.getClass().getName().endsWith("KeyguardRootView")) {
+                            fixKeyguard(root);
+                        }
                     }
-                } catch (Throwable ignored) {
+                } catch (Throwable t) {
+                    XposedBridge.log(t);
                 }
             }
-            try {
-                sb.append(" hBias=").append(c.getField("horizontalBias").getFloat(lp));
-            } catch (Throwable ignored) {
-            }
-        } else {
-            try {
-                sb.append(" gravity=").append(c.getField("gravity").getInt(lp));
-            } catch (Throwable ignored) {
+        };
+        int n = XposedBridge.hookAllMethods(cs, "applyTo", hook).size();
+        n += XposedBridge.hookAllMethods(cs, "applyToWithoutCheck", hook).size();
+        log("ConstraintSet hooks: " + n);
+    }
+
+    private static void fixKeyguard(ViewGroup root) {
+        View clock = null;
+        View date = null;
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View c = root.getChildAt(i);
+            String n = c.getClass().getName();
+            if (n.endsWith(".FlexClockTextView")) clock = c;       // small clock (direct child)
+            else if (n.endsWith(".DateSmartspaceView")) date = c;  // date (+ alarm)
+        }
+        if (clock == null) return;
+
+        if (centerHorizontally(clock)) log("small clock centered");
+
+        if (date != null) {
+            ViewGroup.LayoutParams lp = date.getLayoutParams();
+            int cid = clock.getId();
+            if (lp != null && cid != View.NO_ID
+                    && (getInt(lp, "startToEnd") == cid
+                    || getInt(lp, "topToBottom") == cid
+                    || getInt(lp, "topToTop") == cid)) {
+                boolean v = false;
+                v |= setInt(lp, "topToTop", UNSET);
+                v |= setInt(lp, "bottomToBottom", UNSET);
+                v |= setInt(lp, "topToBottom", cid);
+                boolean h = centerHorizontally(date);
+                if (v && !h) date.setLayoutParams(lp);
+                if (v || h) log("date moved under clock and centered");
             }
         }
+    }
+
+    private static boolean centerHorizontally(View v) {
+        ViewGroup.LayoutParams lp = v.getLayoutParams();
+        if (lp == null || !lp.getClass().getName().contains("ConstraintLayout")) return false;
+        boolean ch = false;
+        String[] clear = {"leftToLeft", "leftToRight", "rightToLeft", "rightToRight",
+                "startToEnd", "endToStart"};
+        for (String f : clear) ch |= setInt(lp, f, UNSET);
+        ch |= setInt(lp, "startToStart", PARENT);
+        ch |= setInt(lp, "endToEnd", PARENT);
+        ch |= setFloat(lp, "horizontalBias", 0.5f);
+        if (lp instanceof ViewGroup.MarginLayoutParams) {
+            ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
+            if (m.getMarginStart() != 0 || m.getMarginEnd() != 0
+                    || m.leftMargin != 0 || m.rightMargin != 0) {
+                m.setMarginStart(0);
+                m.setMarginEnd(0);
+                m.leftMargin = 0;
+                m.rightMargin = 0;
+                ch = true;
+            }
+        }
+        if (ch) v.setLayoutParams(lp);
+        return ch;
+    }
+
+    private static int getInt(Object lp, String name) {
+        try {
+            return lp.getClass().getField(name).getInt(lp);
+        } catch (Throwable t) {
+            return -2;
+        }
+    }
+
+    private static boolean setInt(Object lp, String name, int value) {
+        try {
+            Field f = lp.getClass().getField(name);
+            if (f.getInt(lp) == value) return false;
+            f.setInt(lp, value);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static boolean setFloat(Object lp, String name, float value) {
+        try {
+            Field f = lp.getClass().getField(name);
+            if (f.getFloat(lp) == value) return false;
+            f.setFloat(lp, value);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    // ------------------------------------------------ shelf pill + AOD icons
+
+    private static void hookPreDraw(ClassLoader cl, String className, final boolean isShelf) {
+        Class<?> c = XposedHelpers.findClassIfExists(className, cl);
+        if (c == null) {
+            log("class not found: " + className);
+            return;
+        }
+        int n = XposedBridge.hookAllConstructors(c, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                final View v = (View) param.thisObject;
+                if (!HOOKED.add(v)) return;
+                v.getViewTreeObserver().addOnPreDrawListener(
+                        new ViewTreeObserver.OnPreDrawListener() {
+                            @Override
+                            public boolean onPreDraw() {
+                                try {
+                                    if (isShelf) {
+                                        centerShelf((ViewGroup) v);
+                                    } else if (isAodContainer(v)) {
+                                        centerAodIcons((ViewGroup) v);
+                                    }
+                                } catch (Throwable t) {
+                                    XposedBridge.log(t);
+                                }
+                                return true;
+                            }
+                        });
+            }
+        }).size();
+        log("constructor hooks for " + className + ": " + n);
+    }
+
+    private static boolean isAodContainer(View v) {
+        int id = v.getId();
+        if (id == View.NO_ID) return false;
+        try {
+            return "aod_notification_icon_container".equals(
+                    v.getResources().getResourceEntryName(id));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static void centerAodIcons(ViewGroup c) {
+        if (c.getVisibility() != View.VISIBLE || c.getWidth() == 0) return;
+        float minL = Float.MAX_VALUE;
+        float maxR = -Float.MAX_VALUE;
+        int n = 0;
+        for (int i = 0; i < c.getChildCount(); i++) {
+            View ch = c.getChildAt(i);
+            if (ch.getVisibility() != View.VISIBLE || ch.getWidth() == 0
+                    || ch.getAlpha() < 0.05f) continue;
+            float l = ch.getLeft() + ch.getTranslationX();
+            minL = Math.min(minL, l);
+            maxR = Math.max(maxR, l + ch.getWidth());
+            n++;
+        }
+        if (n == 0) return;
+        float shift = (c.getWidth() - (maxR - minL)) / 2f - minL;
+        if (Math.abs(shift) < 1f) return;
+        for (int i = 0; i < c.getChildCount(); i++) {
+            View ch = c.getChildAt(i);
+            ch.setTranslationX(ch.getTranslationX() + shift);
+        }
+        if (aodLogs++ < 6) log("AOD icons shifted by " + shift + " (icons=" + n + ")");
+    }
+
+    private static void centerShelf(ViewGroup shelf) {
+        if (shelf.getVisibility() != View.VISIBLE || shelf.getWidth() == 0
+                || shelf.getAlpha() < 0.01f) return;
+        View parent = (View) shelf.getParent();
+        if (parent == null) return;
+
+        int full = shelf.getWidth();
+        int pill = pillWidth(shelf);
+        float target = 0f;
+        if (pill > 0 && full - pill > 100) {
+            target = (parent.getWidth() - pill) / 2f - shelf.getLeft();
+        }
+        if (Math.abs(shelf.getTranslationX() - target) > 1f) {
+            shelf.setTranslationX(target);
+            if (shelfLogs++ < 8) {
+                log("shelf: full=" + full + " pill=" + pill + " shift=" + target);
+            }
+        }
+    }
+
+    /** Width of the drawn pill: from the background view if possible, else from the icons. */
+    private static int pillWidth(ViewGroup shelf) {
+        View bg = null;
+        ViewGroup icons = null;
+        for (int i = 0; i < shelf.getChildCount(); i++) {
+            View c = shelf.getChildAt(i);
+            String n = c.getClass().getName();
+            if (n.endsWith("NotificationShelfBackgroundView")) bg = c;
+            else if (n.endsWith("NotificationShelfIconContainer") && c instanceof ViewGroup) {
+                icons = (ViewGroup) c;
+            }
+        }
+        if (bg != null) {
+            try {
+                int w = XposedHelpers.getIntField(bg, "mActualWidth");
+                return w > 0 ? w : 0;       // <=0 means "full width"
+            } catch (Throwable ignored) {
+                // field is named differently on this build: fall back to icons
+            }
+        }
+        if (icons != null) {
+            float minL = Float.MAX_VALUE;
+            float maxR = -Float.MAX_VALUE;
+            int n = 0;
+            for (int i = 0; i < icons.getChildCount(); i++) {
+                View ch = icons.getChildAt(i);
+                if (ch.getVisibility() != View.VISIBLE || ch.getWidth() == 0) continue;
+                float l = ch.getLeft() + ch.getTranslationX();
+                minL = Math.min(minL, l);
+                maxR = Math.max(maxR, l + ch.getWidth());
+                n++;
+            }
+            if (n > 0) return (int) (maxR + minL);   // symmetric padding on both sides
+        }
+        return 0;
     }
 }
