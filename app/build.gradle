@@ -7,13 +7,21 @@ android {
     compileSdk 35
 
     defaultConfig {
-        applicationId 'com.anton.lockcenter'
-        minSdk 28
+        applicationId "com.anton.lockcenter"
+        minSdk 31
         targetSdk 35
         versionCode 1
-        versionName '0.1-scout'
+        versionName "1.0"
     }
 
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -22,5 +30,6 @@ android {
 
 dependencies {
     compileOnly 'de.robv.android.xposed:api:82'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
 }
-
