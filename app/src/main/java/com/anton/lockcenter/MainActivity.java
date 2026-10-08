@@ -16,6 +16,9 @@ import androidx.appcompat.app.AppCompatActivity;
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.slider.Slider;
 
+import java.io.File;
+import java.io.FileWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
@@ -38,7 +41,6 @@ public class MainActivity extends AppCompatActivity {
 
         prefs = getSharedPreferences("lock_center_prefs", Context.MODE_PRIVATE);
 
-        // Загрузка сохранённых значений
         clockScaleX = prefs.getFloat("clock_scale_x", 1.80f);
         clockScaleY = prefs.getFloat("clock_scale_y", 1.50f);
         dateExtraGapPx = prefs.getInt("date_extra_gap_px", 5);
@@ -50,7 +52,6 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout list = findViewById(R.id.settings_list);
 
-        // Карточки настроек
         addFloatRow(list, "Ширина маленьких часов", 0.5f, 3.0f, clockScaleX, 0.05f, v -> clockScaleX = v);
         addFloatRow(list, "Высота маленьких часов", 0.5f, 3.0f, clockScaleY, 0.05f, v -> clockScaleY = v);
         addIntRow(list, "Отступ даты от часов (px)", -50, 150, dateExtraGapPx, v -> dateExtraGapPx = v);
@@ -58,24 +59,32 @@ public class MainActivity extends AppCompatActivity {
         addFloatRow(list, "Высота даты", 0.5f, 2.5f, dateScaleY, 0.05f, v -> dateScaleY = v);
         addFloatRow(list, "Ширина больших часов", 0.5f, 3.0f, largeClockScaleX, 0.05f, v -> largeClockScaleX = v);
         addFloatRow(list, "Высота больших часов", 0.5f, 3.0f, largeClockScaleY, 0.05f, v -> largeClockScaleY = v);
-        addIntRow(list, "Отступ карточки фонарика от даты (px)", -50, 100, cardTopMarginPx, v -> cardTopMarginPx = v);
+        addIntRow(list, "Отступ плашки фонарика от даты (px)", -50, 100, cardTopMarginPx, v -> cardTopMarginPx = v);
 
-        // Кнопка применения
         MaterialButton btnSave = findViewById(R.id.btn_save);
         btnSave.setOnClickListener(v -> {
-            saveAndBroadcast();
+            new Thread(this::saveConfigSync).start();
+            sendSettingsBroadcast();
             Toast.makeText(this, "Настройки сохранены!", Toast.LENGTH_SHORT).show();
         });
 
-        // Кнопка перезагрузки SystemUI
         MaterialButton btnRestart = findViewById(R.id.btn_restart_sysui);
         btnRestart.setOnClickListener(v -> {
-            saveAndBroadcast();
-            restartSystemUI();
+            Toast.makeText(this, "Перезагрузка SystemUI...", Toast.LENGTH_SHORT).show();
+            new Thread(() -> {
+                saveConfigSync();
+                try {
+                    Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", "pkill -f com.android.systemui || killall com.android.systemui"});
+                    p.waitFor();
+                } catch (Throwable t) {
+                    runOnUiThread(() -> Toast.makeText(this, "Ошибка Root: " + t.getMessage(), Toast.LENGTH_LONG).show());
+                }
+            }).start();
         });
     }
 
-    private void saveAndBroadcast() {
+    /** Надежное сохранение файла конфигурации на диск без ошибок консоли */
+    private synchronized void saveConfigSync() {
         prefs.edit()
                 .putFloat("clock_scale_x", clockScaleX)
                 .putFloat("clock_scale_y", clockScaleY)
@@ -87,16 +96,40 @@ public class MainActivity extends AppCompatActivity {
                 .putInt("card_top_margin_px", cardTopMarginPx)
                 .apply();
 
-        // Права на файл для XSharedPreferences через root
-        new Thread(() -> {
-            try {
-                Runtime.getRuntime().exec(new String[]{"su", "-c",
-                        "chmod 777 /data/data/com.anton.lockcenter/shared_prefs && chmod 777 /data/data/com.anton.lockcenter/shared_prefs/lock_center_prefs.xml"});
-            } catch (Throwable ignored) {}
-        }).start();
+        String content = "clock_scale_x=" + clockScaleX + "\n"
+                + "clock_scale_y=" + clockScaleY + "\n"
+                + "date_extra_gap_px=" + dateExtraGapPx + "\n"
+                + "date_scale_x=" + dateScaleX + "\n"
+                + "date_scale_y=" + dateScaleY + "\n"
+                + "large_clock_scale_x=" + largeClockScaleX + "\n"
+                + "large_clock_scale_y=" + largeClockScaleY + "\n"
+                + "card_top_margin_px=" + cardTopMarginPx + "\n";
 
-        // Сигнал на лету
+        try {
+            // 1. Пишем чистый файл во внутреннюю память приложения
+            File localFile = new File(getFilesDir(), "lockcenter.conf");
+            try (FileWriter fw = new FileWriter(localFile)) {
+                fw.write(content);
+                fw.flush();
+            }
+
+            // 2. Копируем его через Root прямо в системный каталог SystemUI
+            String src = localFile.getAbsolutePath();
+            String cmd = "mkdir -p /data/user_de/0/com.android.systemui && "
+                    + "cp " + src + " /data/user_de/0/com.android.systemui/lockcenter.conf && "
+                    + "chmod 666 /data/user_de/0/com.android.systemui/lockcenter.conf && "
+                    + "mkdir -p /data/data/com.android.systemui && "
+                    + "cp " + src + " /data/data/com.android.systemui/lockcenter.conf && "
+                    + "chmod 666 /data/data/com.android.systemui/lockcenter.conf";
+
+            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
+            p.waitFor();
+        } catch (Throwable ignored) {}
+    }
+
+    private void sendSettingsBroadcast() {
         Intent intent = new Intent("com.anton.lockcenter.UPDATE_SETTINGS");
+        intent.setPackage("com.android.systemui");
         intent.putExtra("clock_scale_x", clockScaleX);
         intent.putExtra("clock_scale_y", clockScaleY);
         intent.putExtra("date_extra_gap_px", dateExtraGapPx);
@@ -106,18 +139,6 @@ public class MainActivity extends AppCompatActivity {
         intent.putExtra("large_clock_scale_y", largeClockScaleY);
         intent.putExtra("card_top_margin_px", cardTopMarginPx);
         sendBroadcast(intent);
-    }
-
-    private void restartSystemUI() {
-        Toast.makeText(this, "Перезагрузка SystemUI...", Toast.LENGTH_SHORT).show();
-        new Thread(() -> {
-            try {
-                // Универсальная команда перезагрузки SystemUI для Pixel на Android 16
-                Runtime.getRuntime().exec(new String[]{"su", "-c", "pkill -f com.android.systemui || killall com.android.systemui"});
-            } catch (Throwable t) {
-                runOnUiThread(() -> Toast.makeText(this, "Ошибка Root: " + t.getMessage(), Toast.LENGTH_LONG).show());
-            }
-        }).start();
     }
 
     private interface OnFloatChanged {
