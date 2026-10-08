@@ -35,9 +35,9 @@ public class MainHook implements IXposedHookLoadPackage {
     // ======== БОЛЬШИЕ ЧАСЫ (когда уведомлений нет): растяжение по ширине и (по желанию) по высоте ========
     // По умолчанию тот же множитель, что и у маленьких часов, поэтому отступы от краёв примерно такие же.
     // Хочешь шире или уже: поставь своё число (1.0 = как было).
-    private static final float LARGE_CLOCK_SCALE_X = 1.30f;
+    private static final float LARGE_CLOCK_SCALE_X = 1.35f;
     // Высота больших часов (1.0 = как было, без изменений). Например 1.1 = на 10% выше.
-    private static final float LARGE_CLOCK_SCALE_Y = 1.10f;
+    private static final float LARGE_CLOCK_SCALE_Y = 1.05f;
     // ==================================================================================
 
     // ======== ОТСТУП КАРТОЧКИ («Фонарик включен» и т.п.) ОТ ДАТЫ, px ========
