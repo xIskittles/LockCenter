@@ -229,7 +229,6 @@ public class MainActivity extends AppCompatActivity {
         tv.setText(title);
         tv.setTextSize(16f);
         tv.setTypeface(null, android.graphics.Typeface.BOLD);
-        tv.setTextColor(getColor(com.google.android.material.R.color.material_dynamic_primary80));
         layout.addView(tv);
 
         card.addView(layout);
