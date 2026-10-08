@@ -6,8 +6,6 @@ import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.text.Editable;
 import android.text.TextWatcher;
-import android.view.LayoutInflater;
-import android.view.View;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -52,7 +50,7 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout list = findViewById(R.id.settings_list);
 
-        // Генерация карточек настроек (ползунок + ввод числа)
+        // Карточки настроек
         addFloatRow(list, "Ширина маленьких часов", 0.5f, 3.0f, clockScaleX, 0.05f, v -> clockScaleX = v);
         addFloatRow(list, "Высота маленьких часов", 0.5f, 3.0f, clockScaleY, 0.05f, v -> clockScaleY = v);
         addIntRow(list, "Отступ даты от часов (px)", -50, 150, dateExtraGapPx, v -> dateExtraGapPx = v);
@@ -60,13 +58,13 @@ public class MainActivity extends AppCompatActivity {
         addFloatRow(list, "Высота даты", 0.5f, 2.5f, dateScaleY, 0.05f, v -> dateScaleY = v);
         addFloatRow(list, "Ширина больших часов", 0.5f, 3.0f, largeClockScaleX, 0.05f, v -> largeClockScaleX = v);
         addFloatRow(list, "Высота больших часов", 0.5f, 3.0f, largeClockScaleY, 0.05f, v -> largeClockScaleY = v);
-        addIntRow(list, "Отступ плашки фонарика от даты (px)", -50, 100, cardTopMarginPx, v -> cardTopMarginPx = v);
+        addIntRow(list, "Отступ карточки фонарика от даты (px)", -50, 100, cardTopMarginPx, v -> cardTopMarginPx = v);
 
-        // Кнопка сохранения
+        // Кнопка применения
         MaterialButton btnSave = findViewById(R.id.btn_save);
         btnSave.setOnClickListener(v -> {
             saveAndBroadcast();
-            Toast.makeText(this, "Настройки применены на лету!", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Настройки сохранены!", Toast.LENGTH_SHORT).show();
         });
 
         // Кнопка перезагрузки SystemUI
@@ -89,13 +87,15 @@ public class MainActivity extends AppCompatActivity {
                 .putInt("card_top_margin_px", cardTopMarginPx)
                 .apply();
 
-        // Открываем права на файл для XSharedPreferences
-        try {
-            Runtime.getRuntime().exec(new String[]{"su", "-c",
-                    "chmod 777 /data/data/com.anton.lockcenter/shared_prefs && chmod 777 /data/data/com.anton.lockcenter/shared_prefs/lock_center_prefs.xml"});
-        } catch (Throwable ignored) {}
+        // Права на файл для XSharedPreferences через root
+        new Thread(() -> {
+            try {
+                Runtime.getRuntime().exec(new String[]{"su", "-c",
+                        "chmod 777 /data/data/com.anton.lockcenter/shared_prefs && chmod 777 /data/data/com.anton.lockcenter/shared_prefs/lock_center_prefs.xml"});
+            } catch (Throwable ignored) {}
+        }).start();
 
-        // Отправляем Broadcast в SystemUI
+        // Сигнал на лету
         Intent intent = new Intent("com.anton.lockcenter.UPDATE_SETTINGS");
         intent.putExtra("clock_scale_x", clockScaleX);
         intent.putExtra("clock_scale_y", clockScaleY);
@@ -109,12 +109,15 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void restartSystemUI() {
-        try {
-            Toast.makeText(this, "Перезагрузка SystemUI...", Toast.LENGTH_SHORT).show();
-            Runtime.getRuntime().exec(new String[]{"su", "-c", "killall com.android.systemui"});
-        } catch (Throwable t) {
-            Toast.makeText(this, "Ошибка Root: " + t.getMessage(), Toast.LENGTH_LONG).show();
-        }
+        Toast.makeText(this, "Перезагрузка SystemUI...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            try {
+                // Универсальная команда перезагрузки SystemUI для Pixel на Android 16
+                Runtime.getRuntime().exec(new String[]{"su", "-c", "pkill -f com.android.systemui || killall com.android.systemui"});
+            } catch (Throwable t) {
+                runOnUiThread(() -> Toast.makeText(this, "Ошибка Root: " + t.getMessage(), Toast.LENGTH_LONG).show());
+            }
+        }).start();
     }
 
     private interface OnFloatChanged {
@@ -126,16 +129,18 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void addFloatRow(LinearLayout parent, String title, float min, float max, float current, float step, OnFloatChanged listener) {
-        LinearLayout row = createCard(title);
-        Slider slider = new Slider(this);
-        slider.setValueFrom(min);
-        slider.setValueTo(max);
-        slider.setStepSize(step);
-        slider.setValue(current);
+        LinearLayout content = createCard(parent, title);
 
         EditText input = new EditText(this);
         input.setText(String.format(Locale.US, "%.2f", current));
         input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL);
+
+        Slider slider = new Slider(this);
+        slider.setValueFrom(min);
+        slider.setValueTo(max);
+        slider.setStepSize(step);
+        float safeCurrent = Math.max(min, Math.min(max, current));
+        slider.setValue(safeCurrent);
 
         final boolean[] internal = {false};
 
@@ -163,22 +168,23 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        row.addView(input);
-        row.addView(slider);
-        parent.addView(row);
+        content.addView(input);
+        content.addView(slider);
     }
 
     private void addIntRow(LinearLayout parent, String title, int min, int max, int current, OnIntChanged listener) {
-        LinearLayout row = createCard(title);
-        Slider slider = new Slider(this);
-        slider.setValueFrom(min);
-        slider.setValueTo(max);
-        slider.setStepSize(1f);
-        slider.setValue(current);
+        LinearLayout content = createCard(parent, title);
 
         EditText input = new EditText(this);
         input.setText(String.valueOf(current));
         input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_FLAG_SIGNED);
+
+        Slider slider = new Slider(this);
+        slider.setValueFrom(min);
+        slider.setValueTo(max);
+        slider.setStepSize(1f);
+        float safeCurrent = Math.max(min, Math.min(max, (float) current));
+        slider.setValue(safeCurrent);
 
         final boolean[] internal = {false};
 
@@ -200,19 +206,18 @@ public class MainActivity extends AppCompatActivity {
                 try {
                     int v = Integer.parseInt(s.toString());
                     if (v >= min && v <= max) {
-                        slider.setValue(v);
+                        slider.setValue((float) v);
                         listener.onVal(v);
                     }
                 } catch (Throwable ignored) {}
             }
         });
 
-        row.addView(input);
-        row.addView(slider);
-        parent.addView(row);
+        content.addView(input);
+        content.addView(slider);
     }
 
-    private LinearLayout createCard(String title) {
+    private LinearLayout createCard(LinearLayout parent, String title) {
         com.google.android.material.card.MaterialCardView card = new com.google.android.material.card.MaterialCardView(this);
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -221,20 +226,18 @@ public class MainActivity extends AppCompatActivity {
         card.setCardElevation(2f);
         card.setRadius(28f);
 
-        LinearLayout layout = new LinearLayout(this);
-        layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(32, 24, 32, 16);
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(32, 24, 32, 16);
 
         TextView tv = new TextView(this);
         tv.setText(title);
         tv.setTextSize(16f);
         tv.setTypeface(null, android.graphics.Typeface.BOLD);
-        layout.addView(tv);
+        content.addView(tv);
 
-        card.addView(layout);
-        LinearLayout wrapper = new LinearLayout(this);
-        wrapper.setOrientation(LinearLayout.VERTICAL);
-        wrapper.addView(card);
-        return layout;
+        card.addView(content);
+        parent.addView(card);
+        return content;
     }
 }
