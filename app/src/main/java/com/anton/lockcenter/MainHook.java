@@ -17,7 +17,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * LockCenter v6 (Pixel 7 Pro, Android 16).
+ * LockCenter v7 (Pixel 7 Pro, Android 16).
  *
  * 1) Small clock + date: before EVERY measure pass of KeyguardRootView the module
  *    re-applies its own ConstraintLayout rules (clock centered with zero margins,
@@ -61,7 +61,7 @@ public class MainHook implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
         ClassLoader cl = lpparam.classLoader;
-        log("v6 started");
+        log("v7 started");
         try {
             hookKeyguard(cl);
         } catch (Throwable t) {
@@ -227,7 +227,7 @@ public class MainHook implements IXposedHookLoadPackage {
             int[] n = Arrays.copyOf(ids, ids.length + 1);
             n[ids.length] = dateId;
             XposedHelpers.callMethod(b, "setReferencedIds", (Object) n);
-            if (!inMeasure) b.requestLayout();
+            if (inMeasure) b.forceLayout(); else b.requestLayout();
             if (fixLogs++ < 10) log("barrier extended with date (was " + ids.length + " ids)");
         } catch (Throwable t) {
             if (fixLogs++ < 10) log("barrier fix failed: " + t);
@@ -260,8 +260,12 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private static void apply(View v, ViewGroup.LayoutParams lp, ViewGroup parent, boolean inMeasure) {
-        if (inMeasure) resolve(v, lp, parent);   // inside onMeasure: no requestLayout
-        else v.setLayoutParams(lp);
+        if (inMeasure) {
+            resolve(v, lp, parent);   // inside onMeasure: no requestLayout...
+            v.forceLayout();          // ...but ConstraintLayout must still re-read this child
+        } else {
+            v.setLayoutParams(lp);
+        }
     }
 
     /** We are inside onMeasure: re-resolve the params directly instead of calling requestLayout. */
