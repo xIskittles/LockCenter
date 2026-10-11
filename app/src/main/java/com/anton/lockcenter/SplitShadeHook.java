@@ -1,6 +1,20 @@
 package com.anton.lockcenter;
 
+import android.content.Context;
+
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.InputStream;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -10,14 +24,19 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
  * LockCenter — принудительное включение раздельной шторки (dual shade / split shade).
- * Экспериментально: сработает только если код шторки есть в сборке SystemUI.
  *
- * Включить (из Termux):
- *   su -c "touch /data/data/com.android.systemui/lockcenter_split_shade"
- *   su -c "pkill -f com.android.systemui"
- * Выключить:
- *   su -c "rm -f /data/data/com.android.systemui/lockcenter_split_shade"
- *   su -c "pkill -f com.android.systemui"
+ * Включается наличием файла-маркера:
+ *   su -c 'for d in /data/user_de/0/com.android.systemui /data/user/0/com.android.systemui /data/system; do [ -d "$d" ] && touch "$d/lockcenter_split_shade"; done'
+ * затем перезагрузка (или pkill -f "com.androi[d].systemui").
+ * Выключить: удалить эти файлы и перезагрузиться.
+ *
+ * Что делает хук, если маркер есть:
+ *   1) хукает известные методы-геттеры флагов (dualShade / sceneContainer / splitShade ...),
+ *      возвращая true;
+ *   2) форсирует старый split shade (shouldUseSplitNotificationShade);
+ *   3) читает dex-ы SystemUI и печатает в лог найденные классы с Flag/Dual/Scene/Split,
+ *      а также хукает целевые методы в них — чтобы работало даже если имена классов
+ *      в сборке отличаются от ожидаемых.
  */
 public class SplitShadeHook implements IXposedHookLoadPackage {
 
@@ -26,12 +45,43 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
     private static final String[] MARKER_PATHS = {
             "/data/user_de/0/com.android.systemui/lockcenter_split_shade",
             "/data/data/com.android.systemui/lockcenter_split_shade",
+            "/data/user/0/com.android.systemui/lockcenter_split_shade",
             "/data/system/lockcenter_split_shade"
     };
 
-    /** aconfig-геттеры: com.android.systemui.Flags.<имя>() */
-    private static final String[] ACONFIG_METHODS = {
-            "dualShade", "sceneContainer", "splitShade"
+    /** Методы-геттеры, которые нужно вернуть как true (все без аргументов и boolean). */
+    private static final String[] TARGET_METHODS = {
+            "dualShade",
+            "sceneContainer",
+            "splitShade",
+            "isDualShadeEnabled",
+            "isDualShadeSettingEnabled",
+            "isSplitShadeEnabled",
+            "shouldUseSplitNotificationShade",
+            "isEnabled",
+            "getEnabled"
+    };
+
+    /** Классы-кандидаты: хукаем сразу, не дожидаясь разбора dex. */
+    private static final String[] CANDIDATE_CLASSES = {
+            "com.android.systemui.Flags",
+            "com.android.systemui.FeatureFlagsImpl",
+            "com.android.systemui.FeatureFlags",
+            "com.android.systemui.flags.Flags",
+            "com.android.systemui.flags.FeatureFlagsImpl",
+            "com.android.systemui.flags.FeatureFlags",
+            "com.android.systemui.shade.shared.flag.DualShadeFlag",
+            "com.android.systemui.shade.shared.flag.SplitShadeFlag",
+            "com.android.systemui.scene.shared.flag.SceneContainerFlag",
+            "com.android.systemui.shade.data.repository.ShadeConfigRepository",
+            "com.android.systemui.statusbar.policy.SplitShadeStateControllerImpl"
+    };
+
+    private static final XC_MethodHook RETURN_TRUE = new XC_MethodHook() {
+        @Override
+        protected void beforeHookedMethod(MethodHookParam param) {
+            param.setResult(Boolean.TRUE);
+        }
     };
 
     @Override
@@ -45,58 +95,219 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
         }
         log("маркер найден — форсирую раздельную шторку");
 
-        // 1) Новый dual shade: aconfig-флаги (Kotlin inline-свойства всё равно
-        //    вызывают эти геттеры, поэтому хук по ним работает).
-        forceTrue(cl, "com.android.systemui.Flags", ACONFIG_METHODS);
-        forceTrue(cl, "com.android.systemui.FeatureFlagsImpl", ACONFIG_METHODS);
-        forceTrue(cl, "com.android.systemui.FeatureFlags", ACONFIG_METHODS);
+        // 1) быстрые хуки по известным именам (успевают до инициализации SystemUI)
+        Set<String> hooked = new LinkedHashSet<>();
+        for (int i = 0; i < CANDIDATE_CLASSES.length; i++) {
+            forceTrue(cl, CANDIDATE_CLASSES[i], hooked);
+        }
 
-        // 2) Флаги-объекты самой фичи (на случай, если они не инлайнятся).
-        forceTrue(cl, "com.android.systemui.shade.shared.flag.DualShadeFlag",
-                "isEnabled", "getEnabled");
-        forceTrue(cl, "com.android.systemui.scene.shared.flag.SceneContainerFlag",
-                "isEnabled", "getEnabled");
-
-        // 3) Настройка «двух шторок» включена.
-        forceTrue(cl, "com.android.systemui.shade.data.repository.ShadeConfigRepository",
-                "isDualShadeSettingEnabled");
-
-        // 4) Старый split shade (шторка QS слева, уведомления справа).
-        forceTrue(cl, "com.android.systemui.statusbar.policy.SplitShadeStateControllerImpl",
-                "shouldUseSplitNotificationShade");
+        // 2) разбор dex-ов SystemUI и хуки по фактическим именам классов —
+        //    в фоне, чтобы не тормозить старт SystemUI
+        final Context app = currentApplication(cl);
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    discoverAndHook(cl, app, hooked);
+                } catch (Throwable e) {
+                    log("разбор dex: " + e);
+                }
+            }
+        }, "LockCenter-ShadeScan");
+        t.setPriority(Thread.MIN_PRIORITY);
+        t.start();
     }
 
-    private static void forceTrue(ClassLoader cl, String className, String... methodNames) {
+    // ------------------------------------------------------------------ хуки по имени
+
+    private static void forceTrue(ClassLoader cl, String className, Set<String> hooked) {
         Class<?> cls;
         try {
-            cls = XposedHelpers.findClassIfExists(className, cl);
+            cls = Class.forName(className, false, cl);
         } catch (Throwable t) {
-            log("ошибка поиска класса " + className + ": " + t);
-            return;
-        }
-        if (cls == null) {
             log("класс не найден: " + className);
             return;
         }
-        for (int i = 0; i < methodNames.length; i++) {
-            final String name = methodNames[i];
+        if (cls == null) return;
+
+        for (int i = 0; i < TARGET_METHODS.length; i++) {
+            final String name = TARGET_METHODS[i];
+            Method m;
             try {
-                java.lang.reflect.Method m = XposedHelpers.findMethodExactIfExists(cls, name);
-                if (m == null) {
-                    log("нет метода: " + className + "#" + name);
-                    continue;
+                m = XposedHelpers.findMethodExactIfExists(cls, name);
+            } catch (Throwable t) {
+                continue;
+            }
+            if (m == null) continue;
+
+            Class<?> rt = m.getReturnType();
+            if (rt != boolean.class && rt != Boolean.class) continue;
+            if (!hooked.add(className + "#" + name)) continue;
+
+            if (Modifier.isStatic(m.getModifiers())) {
+                try {
+                    log("было " + className + "#" + name + " = " + m.invoke(null));
+                } catch (Throwable ignored) {
                 }
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        param.setResult(Boolean.TRUE);
-                    }
-                });
+            }
+            try {
+                XposedBridge.hookMethod(m, RETURN_TRUE);
                 log("включил: " + className + "#" + name);
             } catch (Throwable t) {
                 log("не удалось включить " + className + "#" + name + ": " + t);
             }
         }
+    }
+
+    // ------------------------------------------------------------------ разбор dex-ов SystemUI
+
+    private static void discoverAndHook(ClassLoader cl, Context app, Set<String> hooked) {
+        String apk = null;
+        try {
+            if (app != null) apk = app.getPackageCodePath();
+        } catch (Throwable ignored) {
+        }
+        if (apk == null) {
+            log("путь к APK SystemUI неизвестен — разбор dex пропущен");
+            return;
+        }
+        log("APK SystemUI: " + apk);
+
+        List<String> classes = new ArrayList<>();
+        ZipFile zip = null;
+        int budget = 48 * 1024 * 1024;
+        try {
+            zip = new ZipFile(apk);
+            Enumeration<? extends ZipEntry> en = zip.entries();
+            while (en.hasMoreElements()) {
+                ZipEntry e = en.nextElement();
+                if (!e.getName().endsWith(".dex")) continue;
+                if (budget <= 0) break;
+                byte[] data = readAll(zip.getInputStream(e), Math.min(budget, 24 * 1024 * 1024));
+                if (data == null) continue;
+                budget -= data.length;
+                scanDex(data, classes);
+            }
+        } catch (Throwable t) {
+            log("чтение dex не удалось: " + t);
+        } finally {
+            try {
+                if (zip != null) zip.close();
+            } catch (Throwable ignored) {
+            }
+        }
+
+        log("найдено классов с Flag/Dual/Scene/Split: " + classes.size());
+        int shown = 0;
+        for (int i = 0; i < classes.size(); i++) {
+            if (shown >= 120) {
+                log("... список классов обрезан (всего " + classes.size() + ")");
+                break;
+            }
+            log("  класс: " + classes.get(i));
+            shown++;
+        }
+
+        for (int i = 0; i < classes.size(); i++) {
+            forceTrue(cl, classes.get(i), hooked);
+        }
+        log("итого включено методов: " + hooked.size());
+    }
+
+    /** Ищем в байтах dex строки-дескрипторы классов SystemUI с нужными словами. */
+    private static void scanDex(byte[] data, List<String> out) {
+        final byte[] marker = "Lcom/android/systemui/".getBytes();
+        int i = 0;
+        while (i + marker.length < data.length) {
+            if (data[i] != marker[0]) {
+                i++;
+                continue;
+            }
+            boolean ok = true;
+            for (int j = 1; j < marker.length; j++) {
+                if (data[i + j] != marker[j]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                i++;
+                continue;
+            }
+            int end = i;
+            int limit = Math.min(data.length, i + 200);
+            while (end < limit) {
+                byte b = data[end];
+                if (b == ';') break;
+                boolean valid = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+                        || (b >= '0' && b <= '9') || b == '/' || b == '_' || b == '$';
+                if (!valid) {
+                    end = -1;
+                    break;
+                }
+                end++;
+            }
+            if (end <= i || end >= limit) {
+                i++;
+                continue;
+            }
+            String cls = new String(data, i + 1, end - i - 1);
+            String lower = cls.toLowerCase(Locale.US);
+            if (lower.contains("flag") || lower.contains("dualshade") || lower.contains("scenecontainer")
+                    || lower.contains("splitshade") || lower.contains("shademode")
+                    || lower.contains("shadeconfig")) {
+                if (!out.contains(cls) && out.size() < 4000) out.add(cls);
+            }
+            i = end;
+        }
+    }
+
+    private static byte[] readAll(InputStream in, int max) {
+        try {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(1 << 20);
+            byte[] buf = new byte[64 * 1024];
+            int total = 0;
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+                total += n;
+                if (total >= max) break;
+            }
+            return bos.toByteArray();
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            try {
+                in.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ окружение
+
+    private static Context currentApplication(ClassLoader cl) {
+        try {
+            Class<?> at = XposedHelpers.findClassIfExists("android.app.ActivityThread", cl);
+            if (at != null) {
+                Method m = at.getDeclaredMethod("currentApplication");
+                m.setAccessible(true);
+                Object app = m.invoke(null);
+                if (app instanceof Context) return (Context) app;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> helper = XposedHelpers.findClassIfExists("de.robv.android.xposed.AndroidAppHelper", cl);
+            if (helper != null) {
+                Method m = helper.getDeclaredMethod("currentApplication");
+                m.setAccessible(true);
+                Object app = m.invoke(null);
+                if (app instanceof Context) return (Context) app;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     private static boolean markerExists() {
