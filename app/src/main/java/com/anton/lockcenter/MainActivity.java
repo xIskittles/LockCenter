@@ -88,19 +88,19 @@ public class MainActivity extends AppCompatActivity {
         dockLayerMode = prefs.getBoolean("dock_layer_mode", false);
         dockKeepOriginalBg = prefs.getBoolean("dock_keep_original_bg", false);
         dockIncludeSearch = prefs.getBoolean("dock_include_search", true);
-        dockRadiusPx = prefs.getInt("dock_radius_px", 44);
-        dockSideMarginPx = prefs.getInt("dock_side_margin_px", 10);
-        dockTopPadPx = prefs.getInt("dock_top_pad_px", 6);
-        dockBottomPadPx = prefs.getInt("dock_bottom_pad_px", 6);
+        dockRadiusPx = prefs.getInt("dock_radius_px", 95);
+        dockSideMarginPx = prefs.getInt("dock_side_margin_px", 50);
+        dockTopPadPx = prefs.getInt("dock_top_pad_px", -8);
+        dockBottomPadPx = prefs.getInt("dock_bottom_pad_px", 145);
         dockOffsetYPx = prefs.getInt("dock_offset_y_px", 0);
         dockAlpha = prefs.getInt("dock_alpha", 70);
-        dockColorMode = prefs.getInt("dock_color_mode", 0);
+        dockColorMode = prefs.getInt("dock_color_mode", 2);
         dockColorR = prefs.getInt("dock_color_r", 255);
         dockColorG = prefs.getInt("dock_color_g", 255);
         dockColorB = prefs.getInt("dock_color_b", 255);
-        dockStrokeWidthPx = prefs.getInt("dock_stroke_width_px", 1);
+        dockStrokeWidthPx = prefs.getInt("dock_stroke_width_px", 0);
         dockStrokeAlpha = prefs.getInt("dock_stroke_alpha", 40);
-        dockStrokeLighten = prefs.getBoolean("dock_stroke_lighten", true);
+        dockStrokeLighten = prefs.getBoolean("dock_stroke_lighten", false);
         dockFrosted = prefs.getBoolean("dock_frosted", false);
         dockFrostRadius = prefs.getInt("dock_frost_radius", 24);
         dockFrostAlpha = prefs.getInt("dock_frost_alpha", 150);
@@ -209,23 +209,22 @@ public class MainActivity extends AppCompatActivity {
         container.addView(btnSysDump, 0);
 
         MaterialButton btnDualOn = new MaterialButton(this);
-        btnDualOn.setText("Раздельный шейд: ВКЛЮЧИТЬ (эксперимент)");
+        btnDualOn.setText("Раздельная шторка: ВКЛЮЧИТЬ (эксперимент)");
         btnDualOn.setOnClickListener(v -> runShell(
-                "aflags enable com.android.systemui.scene_container --immediate; "
-                        + "aflags enable com.android.systemui.dual_shade --immediate; "
-                        + "settings put secure dual_shade 1; "
-                        + "pkill -f com.android.systemui",
-                "Включаю раздельный шейд, SystemUI перезапустится..."));
+                "for d in /data/user_de/0/com.android.systemui /data/user/0/com.android.systemui /data/system; "
+                        + "do [ -d \"$d\" ] && touch \"$d/lockcenter_split_shade\"; done; "
+                        + "pkill -f com.androi[d].systemui; true",
+                "Включаю раздельную шторку, SystemUI перезапустится..."));
         container.addView(btnDualOn, 1);
 
         MaterialButton btnDualOff = new MaterialButton(this);
-        btnDualOff.setText("Раздельный шейд: ВЫКЛЮЧИТЬ (как было)");
+        btnDualOff.setText("Раздельная шторка: ВЫКЛЮЧИТЬ (как было)");
         btnDualOff.setOnClickListener(v -> runShell(
-                "settings put secure dual_shade 0; "
-                        + "aflags disable com.android.systemui.dual_shade --immediate; "
-                        + "aflags disable com.android.systemui.scene_container --immediate; "
-                        + "pkill -f com.android.systemui",
-                "Возвращаю обычный шейд, SystemUI перезапустится..."));
+                "rm -f /data/user_de/0/com.android.systemui/lockcenter_split_shade "
+                        + "/data/user/0/com.android.systemui/lockcenter_split_shade "
+                        + "/data/system/lockcenter_split_shade; "
+                        + "pkill -f com.androi[d].systemui; true",
+                "Выключаю раздельную шторку, SystemUI перезапустится..."));
         container.addView(btnDualOff, 2);
     }
 
@@ -237,7 +236,7 @@ public class MainActivity extends AppCompatActivity {
             try {
                 Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
                 p.waitFor();
-                msg = "Команда выполнена. Если ничего не изменилось — перезагрузи телефон (или пришли лог: su -c aflags list)";
+                msg = "Команда выполнена. Если шторка не изменилась — посмотри лог с тегом LockCenter/Shade";
             } catch (Throwable t) {
                 msg = "Ошибка: " + t;
             }
