@@ -396,18 +396,20 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         return clamp(channel + Math.round((255 - channel) * 0.45f), 0, 255);
     }
 
-    private static int panelColor(Context ctx) {
+    private static int panelColor(Context ctx, float scale) {
         int c = baseColor(ctx);
-        int a = frosted ? clamp(frostAlpha, 0, 255) : clamp(alpha, 0, 255);
+        int base = frosted ? frostAlpha : alpha;
+        int a = clamp(Math.round(base * clampF(scale, 0f, 1f)), 0, 255);
         return Color.argb(a, Color.red(c), Color.green(c), Color.blue(c));
     }
 
-    private static int strokeColor(Context ctx) {
+    private static int strokeColor(Context ctx, float scale) {
         int c = baseColor(ctx);
         if (strokeLighten) {
             c = Color.rgb(lighten(Color.red(c)), lighten(Color.green(c)), lighten(Color.blue(c)));
         }
-        return Color.argb(clamp(strokeAlpha, 0, 255), Color.red(c), Color.green(c), Color.blue(c));
+        int a = clamp(Math.round(strokeAlpha * clampF(scale, 0f, 1f)), 0, 255);
+        return Color.argb(a, Color.red(c), Color.green(c), Color.blue(c));
     }
 
     // ------------------------------------------------------------------ примитив отрисовки
@@ -422,8 +424,15 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         STROKE_PAINT.setStyle(Paint.Style.STROKE);
     }
 
-    /** Отрисовка подложки: стекло (если включено) → цветная поверхность → обводка. */
-    private static void drawPanel(Canvas canvas, RectF r, View anchor, Context ctx) {
+    /**
+     * Отрисовка подложки: стекло (если включено) → цветная поверхность → обводка.
+     * alphaScale — дополнительная прозрачность. В режиме «фон дока» прозрачность
+     * применяет сама View (поэтому 1f), а слой DragLayer нужно гасить вручную —
+     * иначе подложка остаётся видимой, когда док уже спрятан (меню приложений).
+     */
+    private static void drawPanel(Canvas canvas, RectF r, View anchor, Context ctx, float alphaScale) {
+        float sc = clampF(alphaScale, 0f, 1f);
+        if (sc <= 0.01f) return;
         if (r.width() <= 0.5f || r.height() <= 0.5f) return;
         float rad = Math.min(radiusPx, Math.min(r.width(), r.height()) / 2f);
 
@@ -438,14 +447,14 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 shader.setLocalMatrix(SHADER_MATRIX);
                 FILL_PAINT.setShader(shader);
                 FILL_PAINT.setColorFilter(saturationFilter());
-                FILL_PAINT.setAlpha(255);
+                FILL_PAINT.setAlpha(clamp(Math.round(255f * sc), 0, 255));
                 canvas.drawRoundRect(r, rad, rad, FILL_PAINT);
             }
         }
 
         FILL_PAINT.setShader(null);
         FILL_PAINT.setColorFilter(null);
-        FILL_PAINT.setColor(panelColor(ctx));
+        FILL_PAINT.setColor(panelColor(ctx, sc));
         canvas.drawRoundRect(r, rad, rad, FILL_PAINT);
 
         if (strokeWidthPx > 0 && strokeAlpha > 0) {
@@ -453,7 +462,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             STROKE_RECT.set(r.left + inset, r.top + inset, r.right - inset, r.bottom - inset);
             if (STROKE_RECT.width() > 0.5f && STROKE_RECT.height() > 0.5f) {
                 STROKE_PAINT.setStrokeWidth(strokeWidthPx);
-                STROKE_PAINT.setColor(strokeColor(ctx));
+                STROKE_PAINT.setColor(strokeColor(ctx, sc));
                 float srad = Math.max(0f, rad - inset);
                 canvas.drawRoundRect(STROKE_RECT, srad, srad, STROKE_PAINT);
             }
@@ -934,12 +943,11 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                     lastDrawnValid = false;
                     return;
                 }
-                int a = clamp(Math.round(alpha * pendingAlpha), 0, 255);
-                if (a <= 0 && !frosted && strokeWidthPx <= 0) {
+                if (pendingAlpha <= 0.01f) {
                     lastDrawnValid = false;
                     return;
                 }
-                drawPanel(canvas, rect, container, container.getContext());
+                drawPanel(canvas, rect, container, container.getContext(), pendingAlpha);
                 lastDrawn.set(rect);
                 lastDrawnValid = true;
             } catch (Throwable t) {
@@ -1086,7 +1094,9 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 }
                 best = Math.max(best, a);
             }
-            return best < 0f ? 1f : clampF(best, 0f, 1f);
+            // если в доке не осталось ни одной видимой иконки (меню приложений и т.п.) —
+            // подложку не рисуем, иначе она просвечивает сквозь блюр
+            return best < 0f ? 0f : clampF(best, 0f, 1f);
         }
 
         private float alphaFrom(View v, View stopBefore) {
@@ -1191,7 +1201,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 Rect b = getBounds();
                 if (b.isEmpty()) return;
                 r.set(b.left + insetLeft, b.top + insetTop, b.right - insetRight, b.bottom - insetBottom);
-                drawPanel(canvas, r, anchor, anchor != null ? anchor.getContext() : null);
+                drawPanel(canvas, r, anchor, anchor != null ? anchor.getContext() : null, 1f);
             } catch (Throwable t) {
                 logOnce("PanelDrawable: " + t);
             }
