@@ -10,6 +10,8 @@ import android.graphics.BitmapShader;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ColorFilter;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
@@ -49,7 +51,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * LockCenter — док-панель рабочего стола (Pixel Launcher / Launcher3).
  *
  * Рисует настраиваемую полупрозрачную подложку под доком и, по желанию,
- * под строкой поиска рабочего стола.
+ * под строкой поиска рабочего стола, с лёгкой обводкой и «системным»
+ * матовым стеклом.
  *
  * Два режима (переключаются в приложении):
  *   0 — «Фон дока» (по умолчанию): подложка ставится фоном самой View Hotseat.
@@ -57,14 +60,16 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *       иконками и под строкой поиска (она — ребёнок Hotseat), и автоматически
  *       наследует все системные анимации дока (alpha, scale, translationY).
  *   1 — «Свой слой»: подложка рисуется в display list DragLayer перед его
- *       детьми. Даёт свободную геометрию (сдвиг, ширину, захват строки поиска),
- *       но геометрия пересчитывается каждый кадр в OnPreDraw.
+ *       детьми. Даёт свободную геометрию (расширение за границы дока, сдвиг),
+ *       геометрия пересчитывается каждый кадр в OnPreDraw.
  *
- * Оба режима используют один примитив отрисовки (PanelDrawable): скруглённый
- * прямоугольник заданного цвета/прозрачности либо «матовое стекло» — сэмпл
- * размытых обоев (настоящий backdrop-blur для окна лаунчера недоступен:
- * setBlurBehindRadius размыл бы весь экран, а View.setBackgroundBlurRadius
- * в публичном API не существует).
+ * Отрисовка: скруглённый прямоугольник + опциональная обводка (PanelDrawable
+ * / drawPanel). Цвет — либо вручную (R/G/B), либо из системной палитры
+ * Material You (android.R.color.system_accent1_* / system_neutral1_*).
+ * «Матовое стекло» — сэмпл размытых обоев с регулируемой насыщенностью,
+ * поверх которого рисуется цветная «поверхность» (как системная прозрачность).
+ * Настоящий backdrop-blur окна лаунчера недоступен: setBlurBehindRadius размыл
+ * бы весь экран за окном, а View.setBackgroundBlurRadius в публичном API нет.
  */
 public class DockPanelHook implements IXposedHookLoadPackage {
 
@@ -87,12 +92,17 @@ public class DockPanelHook implements IXposedHookLoadPackage {
     static volatile int bottomPadPx = 6;
     static volatile int offsetYPx = 0;
     static volatile int alpha = 70;
+    static volatile int colorMode = 0;          // 0 = вручную, 1..6 = системные цвета Material You
     static volatile int colorR = 255;
     static volatile int colorG = 255;
     static volatile int colorB = 255;
+    static volatile int strokeWidthPx = 1;      // толщина обводки, 0 = выключена
+    static volatile int strokeAlpha = 40;       // прозрачность обводки
+    static volatile boolean strokeLighten = true;
     static volatile boolean frosted = false;
     static volatile int frostRadius = 24;
     static volatile int frostAlpha = 150;
+    static volatile int frostSaturation = 130;
     static volatile int frostOffsetX = 0;
     static volatile int frostOffsetY = 0;
 
@@ -193,11 +203,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         try {
             loadConfig(hotseat.getContext());
             registerReceiver(hotseat.getContext());
-            log("настройки: режим=" + (mode == MODE_BACKGROUND ? "фон дока" : "свой слой")
-                    + " enabled=" + enabled + " radius=" + radiusPx + " margin=" + sideMarginPx
-                    + " pads=" + topPadPx + "/" + bottomPadPx + " alpha=" + alpha
-                    + " color=" + colorR + "," + colorG + "," + colorB
-                    + " frost=" + frosted + " search=" + includeSearch);
+            logSettings("настройки");
         } catch (Throwable t) {
             log("onHotseatCreated config: " + t);
         }
@@ -357,6 +363,217 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         return NO_QSB;
     }
 
+    // ------------------------------------------------------------------ цвета (Material You + вручную)
+
+    /** Цвет из системной палитры (Material You): те же цвета, что использует система. */
+    private static int systemColor(Context ctx, int cmode) {
+        if (ctx == null || cmode <= 0) return 0;
+        int id;
+        switch (cmode) {
+            case 1: id = android.R.color.system_accent1_100; break;
+            case 2: id = android.R.color.system_accent1_200; break;
+            case 3: id = android.R.color.system_accent1_500; break;
+            case 4: id = android.R.color.system_neutral1_100; break;
+            case 5: id = android.R.color.system_neutral1_500; break;
+            case 6: id = android.R.color.system_accent3_100; break;
+            default: return 0;
+        }
+        try {
+            return ctx.getResources().getColor(id, ctx.getTheme());
+        } catch (Throwable t) {
+            logOnce("systemColor: " + t);
+            return 0;
+        }
+    }
+
+    private static int baseColor(Context ctx) {
+        int c = systemColor(ctx, colorMode);
+        if (c != 0) return c;
+        return Color.rgb(clamp(colorR, 0, 255), clamp(colorG, 0, 255), clamp(colorB, 0, 255));
+    }
+
+    private static int lighten(int channel) {
+        return clamp(channel + Math.round((255 - channel) * 0.45f), 0, 255);
+    }
+
+    private static int panelColor(Context ctx) {
+        int c = baseColor(ctx);
+        int a = frosted ? clamp(frostAlpha, 0, 255) : clamp(alpha, 0, 255);
+        return Color.argb(a, Color.red(c), Color.green(c), Color.blue(c));
+    }
+
+    private static int strokeColor(Context ctx) {
+        int c = baseColor(ctx);
+        if (strokeLighten) {
+            c = Color.rgb(lighten(Color.red(c)), lighten(Color.green(c)), lighten(Color.blue(c)));
+        }
+        return Color.argb(clamp(strokeAlpha, 0, 255), Color.red(c), Color.green(c), Color.blue(c));
+    }
+
+    // ------------------------------------------------------------------ примитив отрисовки
+
+    private static final Paint FILL_PAINT = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private static final Paint STROKE_PAINT = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private static final RectF STROKE_RECT = new RectF();
+    private static final Matrix SHADER_MATRIX = new Matrix();
+
+    static {
+        FILL_PAINT.setStyle(Paint.Style.FILL);
+        STROKE_PAINT.setStyle(Paint.Style.STROKE);
+    }
+
+    /** Отрисовка подложки: стекло (если включено) → цветная поверхность → обводка. */
+    private static void drawPanel(Canvas canvas, RectF r, View anchor, Context ctx) {
+        if (r.width() <= 0.5f || r.height() <= 0.5f) return;
+        float rad = Math.min(radiusPx, Math.min(r.width(), r.height()) / 2f);
+
+        if (frosted) {
+            BitmapShader shader = frostShader(ctx, anchor);
+            if (shader != null) {
+                float f = Math.max(1f, frostFactor);
+                int[] loc = new int[2];
+                if (anchor != null && anchor.isAttachedToWindow()) anchor.getLocationInWindow(loc);
+                SHADER_MATRIX.setScale(1f / f, 1f / f);
+                SHADER_MATRIX.postTranslate((loc[0] + frostOffsetX) / f, (loc[1] + frostOffsetY) / f);
+                shader.setLocalMatrix(SHADER_MATRIX);
+                FILL_PAINT.setShader(shader);
+                FILL_PAINT.setColorFilter(saturationFilter());
+                FILL_PAINT.setAlpha(255);
+                canvas.drawRoundRect(r, rad, rad, FILL_PAINT);
+            }
+        }
+
+        FILL_PAINT.setShader(null);
+        FILL_PAINT.setColorFilter(null);
+        FILL_PAINT.setColor(panelColor(ctx));
+        canvas.drawRoundRect(r, rad, rad, FILL_PAINT);
+
+        if (strokeWidthPx > 0 && strokeAlpha > 0) {
+            float inset = strokeWidthPx / 2f;
+            STROKE_RECT.set(r.left + inset, r.top + inset, r.right - inset, r.bottom - inset);
+            if (STROKE_RECT.width() > 0.5f && STROKE_RECT.height() > 0.5f) {
+                STROKE_PAINT.setStrokeWidth(strokeWidthPx);
+                STROKE_PAINT.setColor(strokeColor(ctx));
+                float srad = Math.max(0f, rad - inset);
+                canvas.drawRoundRect(STROKE_RECT, srad, srad, STROKE_PAINT);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ матовое стекло (сэмпл обоев)
+
+    private static Bitmap frostBitmap;
+    private static BitmapShader frostShader;
+    private static float frostFactor = 24f;
+    private static boolean frostWarned = false;
+
+    private static ColorFilter saturationFilter;
+    private static int saturationFilterKey = -1;
+
+    /** Насыщенность размытого сэмпла обоев (как «vibrancy» в iOS). */
+    private static ColorFilter saturationFilter() {
+        int sat = clamp(frostSaturation, 0, 200);
+        if (sat == 100) return null;
+        if (saturationFilter != null && saturationFilterKey == sat) return saturationFilter;
+        try {
+            ColorMatrix cm = new ColorMatrix();
+            cm.setSaturation(sat / 100f);
+            saturationFilter = new ColorMatrixColorFilter(cm);
+            saturationFilterKey = sat;
+        } catch (Throwable t) {
+            saturationFilter = null;
+            saturationFilterKey = -1;
+        }
+        return saturationFilter;
+    }
+
+    /**
+     * Сэмпл обоев, размытый в несколько проходов (каждый проход — уменьшение
+     * вдвое с билинейной фильтрацией). Результат — мягкое размытие, похожее на
+     * системную прозрачность, без «странных» резких пятен.
+     */
+    private static synchronized BitmapShader frostShader(Context ctx, View anchor) {
+        if (!frostDirty && frostShader != null) return frostShader;
+        frostDirty = false;
+        try {
+            if (ctx == null || anchor == null) return frostShader;
+
+            Drawable d = WallpaperManager.getInstance(ctx).getDrawable();
+            Bitmap src = null;
+            if (d instanceof BitmapDrawable) {
+                src = ((BitmapDrawable) d).getBitmap();
+            } else if (d != null) {
+                int w = d.getIntrinsicWidth();
+                int h = d.getIntrinsicHeight();
+                if (w <= 0 || h <= 0) {
+                    w = 1080;
+                    h = 2400;
+                }
+                Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                Canvas c = new Canvas(b);
+                d.setBounds(0, 0, w, h);
+                d.draw(c);
+                src = b;
+            }
+            if (src == null || src.getWidth() < 8 || src.getHeight() < 8) {
+                if (!frostWarned) {
+                    frostWarned = true;
+                    log("обои недоступны (возможно live wallpaper) — использую обычный цвет");
+                }
+                frostShader = null;
+                return null;
+            }
+
+            int dispW = anchor.getResources().getDisplayMetrics().widthPixels;
+            int dispH = anchor.getResources().getDisplayMetrics().heightPixels;
+            if (dispW <= 0 || dispH <= 0) return frostShader;
+
+            float cover = Math.max(dispW / (float) src.getWidth(), dispH / (float) src.getHeight());
+            float shownW = src.getWidth() * cover;
+            float shownH = src.getHeight() * cover;
+            float originX = (dispW - shownW) / 2f;
+            float originY = (dispH - shownH) / 2f;
+
+            // хотим примерно frostRadius пикселей экрана на один сэмпл
+            float total = Math.max(16f, (float) Math.max(0, frostRadius));
+            float f0 = Math.max(4f, total / 4f);
+            int bw = Math.max(2, Math.round(dispW / f0));
+            int bh = Math.max(2, Math.round(dispH / f0));
+
+            Paint p = new Paint(Paint.FILTER_BITMAP_FLAG);
+            Bitmap cur = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
+            Canvas c = new Canvas(cur);
+            Matrix m = new Matrix();
+            m.setScale(cover / f0, cover / f0);
+            m.postTranslate(originX / f0, originY / f0);
+            c.drawBitmap(src, m, p);
+
+            float factor = f0;
+            for (int pass = 0; pass < 2; pass++) {
+                int prevW = cur.getWidth();
+                int nw = Math.max(2, prevW / 2);
+                int nh = Math.max(2, cur.getHeight() / 2);
+                if (nw < 2 || nh < 2 || nw == prevW) break;
+                Bitmap half = Bitmap.createBitmap(nw, nh, Bitmap.Config.ARGB_8888);
+                Canvas hc = new Canvas(half);
+                hc.drawBitmap(cur, null, new Rect(0, 0, nw, nh), p);
+                cur = half;
+                factor *= (float) prevW / (float) nw;
+            }
+
+            frostBitmap = cur;
+            frostFactor = factor;
+            frostShader = new BitmapShader(cur, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+            log("матовое стекло: обои " + src.getWidth() + "x" + src.getHeight()
+                    + " -> сэмпл " + cur.getWidth() + "x" + cur.getHeight()
+                    + " (шаг " + Math.round(factor) + "px, насыщенность " + frostSaturation + "%)");
+        } catch (Throwable t) {
+            frostShader = null;
+            logOnce("frostShader: " + t);
+        }
+        return frostShader;
+    }
+
     // ------------------------------------------------------------------ режим «фон дока»
 
     private static final Map<View, Drawable> ORIGINAL_BG =
@@ -389,8 +606,9 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             ORIGINAL_BG.put(hotseat, hotseat.getBackground());
         }
 
-        int topInset = Math.max(0, topPadPx) + Math.max(0, offsetYPx);
-        int bottomInset = Math.max(0, bottomPadPx) + Math.max(0, -offsetYPx);
+        // отрицательные отступы = подложка выходит за границы дока (расширение)
+        int topInset = topPadPx + Math.max(0, offsetYPx);
+        int bottomInset = bottomPadPx + Math.max(0, -offsetYPx);
 
         if (!includeSearch) {
             // подложка должна начинаться под строкой поиска (она — ребёнок Hotseat)
@@ -401,7 +619,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             }
         }
 
-        int sideInset = Math.max(0, sideMarginPx);
+        int sideInset = sideMarginPx;
 
         // Свой Drawable вместо InsetDrawable: InsetDrawable отдаёт свои отступы как
         // padding фона, а View добавил бы их к своим — иконки дока могли бы съехать.
@@ -419,8 +637,8 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             APPLIED_BG.put(hotseat, result);
             APPLIED_BG_SIG.put(hotseat, sig);
             log("фон дока применён: insets=" + sideInset + "/" + topInset + "/" + sideInset + "/" + bottomInset
-                    + " radius=" + radiusPx + " color=" + colorR + "," + colorG + "," + colorB + "/" + alpha
-                    + " frost=" + frosted + (keepOriginalBg ? " (поверх родного фона)" : " (родной фон заменён)"));
+                    + " radius=" + radiusPx + " stroke=" + strokeWidthPx + "/" + strokeAlpha
+                    + " color=" + describeColorMode() + " alpha=" + alpha + " frost=" + frosted);
         } catch (Throwable t) {
             logOnce("setBackground: " + t);
         }
@@ -442,8 +660,10 @@ public class DockPanelHook implements IXposedHookLoadPackage {
     private static int backgroundSignature(View hotseat) {
         int h = 17;
         h = 31 * h + radiusPx + 3 * sideMarginPx + 5 * topPadPx + 7 * bottomPadPx + 11 * offsetYPx;
-        h = 31 * h + alpha + 7 * colorR + 13 * colorG + 29 * colorB;
-        h = 31 * h + (frosted ? 1 : 0) + 3 * frostAlpha + 5 * frostRadius + 7 * frostOffsetX + 11 * frostOffsetY;
+        h = 31 * h + alpha + 7 * colorR + 13 * colorG + 29 * colorB + 37 * colorMode;
+        h = 31 * h + 41 * strokeWidthPx + 43 * strokeAlpha + (strokeLighten ? 47 : 0);
+        h = 31 * h + (frosted ? 1 : 0) + 3 * frostAlpha + 5 * frostRadius
+                + 7 * frostOffsetX + 11 * frostOffsetY + 53 * frostSaturation;
         h = 31 * h + (includeSearch ? 1 : 0) + (keepOriginalBg ? 2 : 0);
         h = 31 * h + hotseat.getWidth() + 3 * hotseat.getHeight() + 5 * hotseat.getPaddingTop();
         View qsb = readSearchView(hotseat);
@@ -461,10 +681,8 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         WeakReference<View> hotseatRef = new WeakReference<>(null);
         WeakReference<View> searchRef = new WeakReference<>(null);
 
-        final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         final RectF rect = new RectF();
         final RectF lastDrawn = new RectF();
-        final Matrix frostMatrix = new Matrix();
 
         boolean registered = false;
         boolean visible = false;
@@ -479,7 +697,6 @@ public class DockPanelHook implements IXposedHookLoadPackage {
 
         PanelState(ViewGroup container) {
             this.container = container;
-            paint.setStyle(Paint.Style.FILL);
         }
 
         void setHotseat(View v) {
@@ -596,47 +813,26 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             h = 31 * h + Math.round(rect.bottom);
             h = 31 * h + radiusPx;
             h = 31 * h + Math.round(pendingAlpha * 100f);
-            h = 31 * h + alpha + 7 * colorR + 13 * colorG + 29 * colorB;
+            h = 31 * h + alpha + 7 * colorR + 13 * colorG + 29 * colorB + 37 * colorMode;
+            h = 31 * h + 41 * strokeWidthPx + 43 * strokeAlpha + (strokeLighten ? 47 : 0);
             h = 31 * h + (frosted ? 1 : 0) + 3 * frostAlpha + 5 * frostRadius
-                    + 7 * frostOffsetX + 11 * frostOffsetY;
+                    + 7 * frostOffsetX + 11 * frostOffsetY + 53 * frostSaturation;
             return h;
         }
 
-        /** Рисуется перед дочерними View контейнера — то есть под всем контентом лаунчера. */
+        /** Рисуется в контейнер до его детей: в режиме «свой слой» — под всем контентом. */
         void drawOn(Canvas canvas) {
             try {
                 if (mode != MODE_LAYER || !visible || rect.width() <= 0.5f || rect.height() <= 0.5f) {
                     lastDrawnValid = false;
                     return;
                 }
-                int colorAlpha = clamp(Math.round(alpha * pendingAlpha), 0, 255);
-                if (colorAlpha <= 0 && !frosted) {
+                int a = clamp(Math.round(alpha * pendingAlpha), 0, 255);
+                if (a <= 0 && !frosted && strokeWidthPx <= 0) {
                     lastDrawnValid = false;
                     return;
                 }
-
-                boolean useFrost = false;
-                if (frosted) {
-                    BitmapShader shader = frostShader(container.getContext(), container);
-                    if (shader != null) {
-                        float f = frostSampleFactor();
-                        int[] loc = new int[2];
-                        container.getLocationInWindow(loc);
-                        frostMatrix.setScale(1f / f, 1f / f);
-                        frostMatrix.postTranslate((loc[0] + frostOffsetX) / f, (loc[1] + frostOffsetY) / f);
-                        shader.setLocalMatrix(frostMatrix);
-                        paint.setShader(shader);
-                        paint.setAlpha(clamp(Math.round(frostAlpha * pendingAlpha), 0, 255));
-                        useFrost = true;
-                    }
-                }
-                if (!useFrost) {
-                    paint.setShader(null);
-                    paint.setColor(Color.argb(colorAlpha, colorR, colorG, colorB));
-                }
-
-                float rad = Math.min(radiusPx, Math.min(rect.width(), rect.height()) / 2f);
-                canvas.drawRoundRect(rect, rad, rad, paint);
+                drawPanel(canvas, rect, container, container.getContext());
                 lastDrawn.set(rect);
                 lastDrawnValid = true;
             } catch (Throwable t) {
@@ -671,6 +867,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             if (dockBox.width() <= 1f || dockBox.height() <= 1f) return false;
             if (dockBox.centerY() < H * 0.55f) return false;   // док должен быть в нижней части экрана
 
+            // отступы могут быть отрицательными — тогда подложка расширяется за границы дока
             float top = dockBox.top - topPadPx;
             float bottom = dockBox.bottom + bottomPadPx;
 
@@ -688,7 +885,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             top += offsetYPx;
             bottom += offsetYPx;
 
-            float margin = clamp(sideMarginPx, 0, Math.max(0, W / 2 - 8));
+            float margin = clamp(sideMarginPx, -200, Math.max(0, W / 2 - 8));
             float left = margin;
             float right = W - margin;
 
@@ -852,9 +1049,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ------------------------------------------------------------------ примитив отрисовки
-
-    /** Один и тот же прямоугольник со скруглением используется в обоих режимах. */
+    /** Фон Hotseat: рисует ту же подложку, но в своих границах. */
     private static final class PanelDrawable extends Drawable {
 
         private final View anchor;
@@ -862,9 +1057,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         private final int insetTop;
         private final int insetRight;
         private final int insetBottom;
-        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF r = new RectF();
-        private final Matrix matrix = new Matrix();
 
         PanelDrawable(View anchor, int insetLeft, int insetTop, int insetRight, int insetBottom) {
             this.anchor = anchor;
@@ -880,30 +1073,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 Rect b = getBounds();
                 if (b.isEmpty()) return;
                 r.set(b.left + insetLeft, b.top + insetTop, b.right - insetRight, b.bottom - insetBottom);
-                if (r.width() <= 0.5f || r.height() <= 0.5f) return;
-
-                boolean useFrost = false;
-                if (frosted) {
-                    BitmapShader shader = frostShader(anchor.getContext(), anchor);
-                    if (shader != null) {
-                        float f = frostSampleFactor();
-                        int[] loc = new int[2];
-                        if (anchor.isAttachedToWindow()) anchor.getLocationInWindow(loc);
-                        matrix.setScale(1f / f, 1f / f);
-                        matrix.postTranslate((loc[0] + frostOffsetX) / f, (loc[1] + frostOffsetY) / f);
-                        shader.setLocalMatrix(matrix);
-                        paint.setShader(shader);
-                        paint.setAlpha(clamp(frostAlpha, 0, 255));
-                        useFrost = true;
-                    }
-                }
-                if (!useFrost) {
-                    paint.setShader(null);
-                    paint.setColor(Color.argb(clamp(alpha, 0, 255), colorR, colorG, colorB));
-                }
-
-                float rad = Math.min(radiusPx, Math.min(r.width(), r.height()) / 2f);
-                canvas.drawRoundRect(r, rad, rad, paint);
+                drawPanel(canvas, r, anchor, anchor != null ? anchor.getContext() : null);
             } catch (Throwable t) {
                 logOnce("PanelDrawable: " + t);
             }
@@ -921,80 +1091,6 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         public int getOpacity() {
             return PixelFormat.TRANSLUCENT;
         }
-    }
-
-    // ------------------------------------------------------------------ матовое стекло (сэмпл обоев)
-
-    private static Bitmap frostBitmap;
-    private static BitmapShader frostShader;
-    private static boolean frostWarned = false;
-
-    private static float frostSampleFactor() {
-        return Math.max(8f, (float) Math.max(0, frostRadius));
-    }
-
-    private static synchronized BitmapShader frostShader(Context ctx, View anchor) {
-        if (!frostDirty && frostShader != null) return frostShader;
-        frostDirty = false;
-        try {
-            if (ctx == null) return frostShader;
-
-            Drawable d = WallpaperManager.getInstance(ctx).getDrawable();
-            Bitmap src = null;
-            if (d instanceof BitmapDrawable) {
-                src = ((BitmapDrawable) d).getBitmap();
-            } else if (d != null) {
-                int w = d.getIntrinsicWidth();
-                int h = d.getIntrinsicHeight();
-                if (w <= 0 || h <= 0) {
-                    w = 1080;
-                    h = 2400;
-                }
-                Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-                Canvas c = new Canvas(b);
-                d.setBounds(0, 0, w, h);
-                d.draw(c);
-                src = b;
-            }
-            if (src == null || src.getWidth() < 8 || src.getHeight() < 8) {
-                if (!frostWarned) {
-                    frostWarned = true;
-                    log("обои недоступны (возможно live wallpaper) — использую обычный цвет");
-                }
-                frostShader = null;
-                return null;
-            }
-
-            int dispW = anchor.getResources().getDisplayMetrics().widthPixels;
-            int dispH = anchor.getResources().getDisplayMetrics().heightPixels;
-            if (dispW <= 0 || dispH <= 0) return frostShader;
-
-            float cover = Math.max(dispW / (float) src.getWidth(), dispH / (float) src.getHeight());
-            float shownW = src.getWidth() * cover;
-            float shownH = src.getHeight() * cover;
-            float originX = (dispW - shownW) / 2f;
-            float originY = (dispH - shownH) / 2f;
-
-            float f = frostSampleFactor();
-            int bw = Math.max(2, Math.round(dispW / f));
-            int bh = Math.max(2, Math.round(dispH / f));
-            Bitmap out = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
-            Canvas c = new Canvas(out);
-            Matrix m = new Matrix();
-            m.setScale(cover / f, cover / f);
-            m.postTranslate(originX / f, originY / f);
-            Paint p = new Paint(Paint.FILTER_BITMAP_FLAG);
-            c.drawBitmap(src, m, p);
-
-            frostBitmap = out;
-            frostShader = new BitmapShader(out, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
-            log("матовое стекло: " + src.getWidth() + "x" + src.getHeight()
-                    + " -> сэмпл " + bw + "x" + bh + " (шаг " + f + "px)");
-        } catch (Throwable t) {
-            frostShader = null;
-            logOnce("frostShader: " + t);
-        }
-        return frostShader;
     }
 
     // ------------------------------------------------------------------ поиск строки поиска
@@ -1039,6 +1135,18 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         }
         sb.append(" [").append(v.getWidth()).append('x').append(v.getHeight()).append(']');
         return sb.toString();
+    }
+
+    private static String describeColorMode() {
+        switch (colorMode) {
+            case 1: return "системный accent1-100";
+            case 2: return "системный accent1-200";
+            case 3: return "системный accent1-500";
+            case 4: return "системный neutral1-100";
+            case 5: return "системный neutral1-500";
+            case 6: return "системный accent3-100";
+            default: return "вручную " + colorR + "," + colorG + "," + colorB;
+        }
     }
 
     // ------------------------------------------------------------------ дамп дерева (диагностика)
@@ -1152,14 +1260,18 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             else if ("dock_keep_original_bg".equals(k)) keepOriginalBg = bool(v);
             else if ("dock_include_search".equals(k)) includeSearch = bool(v);
             else if ("dock_radius_px".equals(k)) radiusPx = clamp(intOf(v, radiusPx), 0, 200);
-            else if ("dock_side_margin_px".equals(k)) sideMarginPx = clamp(intOf(v, sideMarginPx), 0, 200);
-            else if ("dock_top_pad_px".equals(k)) topPadPx = clamp(intOf(v, topPadPx), 0, 200);
-            else if ("dock_bottom_pad_px".equals(k)) bottomPadPx = clamp(intOf(v, bottomPadPx), 0, 200);
+            else if ("dock_side_margin_px".equals(k)) sideMarginPx = clamp(intOf(v, sideMarginPx), -200, 200);
+            else if ("dock_top_pad_px".equals(k)) topPadPx = clamp(intOf(v, topPadPx), -200, 200);
+            else if ("dock_bottom_pad_px".equals(k)) bottomPadPx = clamp(intOf(v, bottomPadPx), -200, 200);
             else if ("dock_offset_y_px".equals(k)) offsetYPx = clamp(intOf(v, offsetYPx), -400, 400);
             else if ("dock_alpha".equals(k)) alpha = clamp(intOf(v, alpha), 0, 255);
+            else if ("dock_color_mode".equals(k)) colorMode = clamp(intOf(v, colorMode), 0, 6);
             else if ("dock_color_r".equals(k)) colorR = clamp(intOf(v, colorR), 0, 255);
             else if ("dock_color_g".equals(k)) colorG = clamp(intOf(v, colorG), 0, 255);
             else if ("dock_color_b".equals(k)) colorB = clamp(intOf(v, colorB), 0, 255);
+            else if ("dock_stroke_width_px".equals(k)) strokeWidthPx = clamp(intOf(v, strokeWidthPx), 0, 16);
+            else if ("dock_stroke_alpha".equals(k)) strokeAlpha = clamp(intOf(v, strokeAlpha), 0, 255);
+            else if ("dock_stroke_lighten".equals(k)) strokeLighten = bool(v);
             else if ("dock_frosted".equals(k)) {
                 boolean nv = bool(v);
                 if (nv != frosted) frostDirty = true;
@@ -1169,6 +1281,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 if (nv != frostRadius) frostDirty = true;
                 frostRadius = nv;
             } else if ("dock_frost_alpha".equals(k)) frostAlpha = clamp(intOf(v, frostAlpha), 0, 255);
+            else if ("dock_frost_saturation".equals(k)) frostSaturation = clamp(intOf(v, frostSaturation), 0, 200);
             else if ("dock_frost_offset_x".equals(k)) frostOffsetX = clamp(intOf(v, frostOffsetX), -1000, 1000);
             else if ("dock_frost_offset_y".equals(k)) frostOffsetY = clamp(intOf(v, frostOffsetY), -1000, 1000);
         } catch (Throwable ignored) {
@@ -1213,10 +1326,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                             dumpRequested = true;
                         }
                         invalidateAll();
-                        log("настройки обновлены: режим=" + (mode == MODE_BACKGROUND ? "фон дока" : "свой слой")
-                                + " enabled=" + enabled + " radius=" + radiusPx + " margin=" + sideMarginPx
-                                + " pads=" + topPadPx + "/" + bottomPadPx + " alpha=" + alpha
-                                + " color=" + colorR + "," + colorG + "," + colorB + " frost=" + frosted);
+                        logSettings("настройки обновлены");
                     } catch (Throwable t) {
                         log("onReceive: " + t);
                     }
@@ -1240,6 +1350,15 @@ public class DockPanelHook implements IXposedHookLoadPackage {
     }
 
     // ------------------------------------------------------------------ лог
+
+    private static void logSettings(String prefix) {
+        log(prefix + ": режим=" + (mode == MODE_BACKGROUND ? "фон дока" : "свой слой")
+                + " enabled=" + enabled + " radius=" + radiusPx + " stroke=" + strokeWidthPx + "/" + strokeAlpha
+                + " margin=" + sideMarginPx + " pads=" + topPadPx + "/" + bottomPadPx
+                + " alpha=" + alpha + " color=" + describeColorMode()
+                + " frost=" + frosted + "/" + frostRadius + "/" + frostAlpha + "/" + frostSaturation
+                + " search=" + includeSearch);
+    }
 
     private static void log(String msg) {
         try {
