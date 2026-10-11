@@ -371,19 +371,38 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Файл диагностики в данных SystemUI; перезаписывается при каждом старте. */
+    /** Файл диагностики; перезаписывается при каждом старте SystemUI. */
     private static void initLogFile(Context app) {
+        java.util.List<File> candidates = new java.util.ArrayList<>();
         try {
-            if (app == null) return;
-            File f = new File(app.getFilesDir(), "lockcenter_shade.txt");
-            java.io.FileWriter w = new java.io.FileWriter(f, false);
-            w.write("=== LockCenter: раздельная шторка, " + new java.util.Date() + " ===\n");
-            w.close();
-            logFile = f;
-        } catch (Throwable t) {
+            if (app != null) candidates.add(new File(app.getFilesDir(), "lockcenter_shade.txt"));
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (app != null && app.getExternalFilesDir(null) != null) {
+                candidates.add(new File(app.getExternalFilesDir(null), "lockcenter_shade.txt"));
+            }
+        } catch (Throwable ignored) {
+        }
+        candidates.add(new File("/data/system/lockcenter_shade.txt"));
+        candidates.add(new File("/data/local/tmp/lockcenter_shade.txt"));
+        for (int i = 0; i < candidates.size(); i++) {
             try {
-                XposedBridge.log(TAG + "файл лога недоступен: " + t);
+                File f = candidates.get(i);
+                java.io.FileWriter w = new java.io.FileWriter(f, false);
+                w.write("=== LockCenter: раздельная шторка, " + new java.util.Date() + " ===\n");
+                w.close();
+                logFile = f;
+                try {
+                    XposedBridge.log(TAG + "диагностика пишется в " + f);
+                } catch (Throwable ignored) {
+                }
+                return;
             } catch (Throwable ignored) {
             }
+        }
+        try {
+            XposedBridge.log(TAG + "файл диагностики не создался ни в одном месте");
+        } catch (Throwable ignored) {
         }
     }}

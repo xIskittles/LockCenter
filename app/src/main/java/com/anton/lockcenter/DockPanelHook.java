@@ -88,21 +88,21 @@ public class DockPanelHook implements IXposedHookLoadPackage {
     static volatile boolean includeSearch = true;
     static volatile int radiusPx = 95;
     static volatile int sideMarginPx = 50;
-    static volatile int topPadPx = -8;
-    static volatile int bottomPadPx = 145;
+    static volatile int topPadPx = -15;
+    static volatile int bottomPadPx = 140;
     static volatile int offsetYPx = 0;
     static volatile int alpha = 70;
-    static volatile int colorMode = 2;          // 0 = вручную, 1..6 = системные цвета Material You
+    static volatile int colorMode = 3;          // 0 = вручную, 1..6 = системные цвета Material You
     static volatile int colorR = 255;
     static volatile int colorG = 255;
     static volatile int colorB = 255;
-    static volatile int strokeWidthPx = 0;      // толщина обводки, 0 = выключена
-    static volatile int strokeAlpha = 40;       // прозрачность обводки
+    static volatile int strokeWidthPx = 8;      // толщина обводки, 0 = выключена
+    static volatile int strokeAlpha = 200;      // прозрачность обводки
     static volatile boolean strokeLighten = false;
-    static volatile boolean frosted = false;
-    static volatile int frostRadius = 24;
-    static volatile int frostAlpha = 150;
-    static volatile int frostSaturation = 130;
+    static volatile boolean frosted = true;
+    static volatile int frostRadius = 60;
+    static volatile int frostAlpha = 125;
+    static volatile int frostSaturation = 145;
     static volatile int frostOffsetX = 0;
     static volatile int frostOffsetY = 0;
 

@@ -75,14 +75,14 @@ public class MainActivity extends AppCompatActivity {
         prefs = getSharedPreferences("lock_center_prefs", Context.MODE_PRIVATE);
 
         clockScaleX = prefs.getFloat("clock_scale_x", 1.60f);
-        clockScaleY = prefs.getFloat("clock_scale_y", 1.30f);
-        dateExtraGapPx = prefs.getInt("date_extra_gap_px", -20);
-        dateScaleX = prefs.getFloat("date_scale_x", 1.30f);
-        dateScaleY = prefs.getFloat("date_scale_y", 1.15f);
-        largeClockScaleX = prefs.getFloat("large_clock_scale_x", 1.35f);
-        largeClockScaleY = prefs.getFloat("large_clock_scale_y", 1.05f);
-        cardTopMarginPx = prefs.getInt("card_top_margin_px", -50);
-        notifTopMarginPx = prefs.getInt("notif_top_margin_px", 0);
+        clockScaleY = prefs.getFloat("clock_scale_y", 1.35f);
+        dateExtraGapPx = prefs.getInt("date_extra_gap_px", -50);
+        dateScaleX = prefs.getFloat("date_scale_x", 1.20f);
+        dateScaleY = prefs.getFloat("date_scale_y", 1.05f);
+        largeClockScaleX = prefs.getFloat("large_clock_scale_x", 1.30f);
+        largeClockScaleY = prefs.getFloat("large_clock_scale_y", 1.10f);
+        cardTopMarginPx = prefs.getInt("card_top_margin_px", -80);
+        notifTopMarginPx = prefs.getInt("notif_top_margin_px", -15);
 
         dockEnabled = prefs.getBoolean("dock_enabled", true);
         dockLayerMode = prefs.getBoolean("dock_layer_mode", false);
@@ -90,21 +90,21 @@ public class MainActivity extends AppCompatActivity {
         dockIncludeSearch = prefs.getBoolean("dock_include_search", true);
         dockRadiusPx = prefs.getInt("dock_radius_px", 95);
         dockSideMarginPx = prefs.getInt("dock_side_margin_px", 50);
-        dockTopPadPx = prefs.getInt("dock_top_pad_px", -8);
-        dockBottomPadPx = prefs.getInt("dock_bottom_pad_px", 145);
+        dockTopPadPx = prefs.getInt("dock_top_pad_px", -15);
+        dockBottomPadPx = prefs.getInt("dock_bottom_pad_px", 140);
         dockOffsetYPx = prefs.getInt("dock_offset_y_px", 0);
         dockAlpha = prefs.getInt("dock_alpha", 70);
-        dockColorMode = prefs.getInt("dock_color_mode", 2);
+        dockColorMode = prefs.getInt("dock_color_mode", 3);
         dockColorR = prefs.getInt("dock_color_r", 255);
         dockColorG = prefs.getInt("dock_color_g", 255);
         dockColorB = prefs.getInt("dock_color_b", 255);
-        dockStrokeWidthPx = prefs.getInt("dock_stroke_width_px", 0);
-        dockStrokeAlpha = prefs.getInt("dock_stroke_alpha", 40);
+        dockStrokeWidthPx = prefs.getInt("dock_stroke_width_px", 8);
+        dockStrokeAlpha = prefs.getInt("dock_stroke_alpha", 200);
         dockStrokeLighten = prefs.getBoolean("dock_stroke_lighten", false);
-        dockFrosted = prefs.getBoolean("dock_frosted", false);
-        dockFrostRadius = prefs.getInt("dock_frost_radius", 24);
-        dockFrostAlpha = prefs.getInt("dock_frost_alpha", 150);
-        dockFrostSaturation = prefs.getInt("dock_frost_saturation", 130);
+        dockFrosted = prefs.getBoolean("dock_frosted", true);
+        dockFrostRadius = prefs.getInt("dock_frost_radius", 60);
+        dockFrostAlpha = prefs.getInt("dock_frost_alpha", 125);
+        dockFrostSaturation = prefs.getInt("dock_frost_saturation", 145);
         dockFrostOffsetX = prefs.getInt("dock_frost_offset_x", 0);
         dockFrostOffsetY = prefs.getInt("dock_frost_offset_y", 0);
 
