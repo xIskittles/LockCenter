@@ -42,6 +42,8 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "[LockCenter/Shade] ";
 
+    /** Файл с диагностикой (читается из Termux без логов). */
+    private static File logFile;
     private static final String[] MARKER_PATHS = {
             "/data/user_de/0/com.android.systemui/lockcenter_split_shade",
             "/data/data/com.android.systemui/lockcenter_split_shade",
@@ -89,7 +91,11 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
         final ClassLoader cl = lpparam.classLoader;
 
-        if (!markerExists()) {
+        final Context app = currentApplication(cl);
+        initLogFile(app);
+        final boolean marker = markerExists();
+        log("хук запущен в SystemUI: маркер=" + marker + ", файл=" + logFile);
+        if (!marker) {
             log("маркера нет — раздельную шторку не трогаю");
             return;
         }
@@ -103,7 +109,6 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
 
         // 2) разбор dex-ов SystemUI и хуки по фактическим именам классов —
         //    в фоне, чтобы не тормозить старт SystemUI
-        final Context app = currentApplication(cl);
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
@@ -348,10 +353,37 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
         return false;
     }
 
+    /**
+     * Пишем диагностику и в лог Xposed, и в файл — файл легко прочитать из Termux:
+     *   su -c 'cat /data/user/0/com.android.systemui/files/lockcenter_shade.txt'
+     */
     private static void log(String msg) {
         try {
             XposedBridge.log(TAG + msg);
         } catch (Throwable ignored) {
         }
+        try {
+            if (logFile == null) return;
+            java.io.FileWriter w = new java.io.FileWriter(logFile, true);
+            w.write(msg + "\n");
+            w.close();
+        } catch (Throwable ignored) {
+        }
     }
-}
+
+    /** Файл диагностики в данных SystemUI; перезаписывается при каждом старте. */
+    private static void initLogFile(Context app) {
+        try {
+            if (app == null) return;
+            File f = new File(app.getFilesDir(), "lockcenter_shade.txt");
+            java.io.FileWriter w = new java.io.FileWriter(f, false);
+            w.write("=== LockCenter: раздельная шторка, " + new java.util.Date() + " ===\n");
+            w.close();
+            logFile = f;
+        } catch (Throwable t) {
+            try {
+                XposedBridge.log(TAG + "файл лога недоступен: " + t);
+            } catch (Throwable ignored) {
+            }
+        }
+    }}
