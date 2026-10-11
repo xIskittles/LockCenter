@@ -588,6 +588,11 @@ public class DockPanelHook implements IXposedHookLoadPackage {
     /** Время последнего setBackground — защита от мигания во время анимаций. */
     private static volatile long lastBgApplyTime = 0L;
 
+    /** Нужно расширение за границы дока: тогда подложку рисует DragLayer, а не фон Hotseat. */
+    static boolean overhangRequested() {
+        return topPadPx < 0 || bottomPadPx < 0 || sideMarginPx < 0;
+    }
+
     static void updateHotseatBackground(View hotseat) {
         if (hotseat == null) return;
         if (mode != MODE_BACKGROUND || !enabled) {
@@ -614,15 +619,17 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             ORIGINAL_BG.put(hotseat, hotseat.getBackground());
         }
 
-        // ВАЖНО: в режиме «фон дока» подложка живёт внутри границ Hotseat.
-        // Отрицательные отступы (расширение за границы дока) система обрезает
-        // во время анимаций — отсюда «пропадающая полоса» сверху. Для расширения
-        // есть режим «свой слой».
+        // Если нужны отрицательные отступы (расширение), фон Hotseat не подходит:
+        // система обрезает всё, что выходит за границы View. Тогда подложку рисует
+        // DragLayer — см. overhangRequested()/overlayMode(), геометрия остаётся той же.
+        if (overhangRequested()) {
+            restoreHotseatBackground(hotseat);
+            logOnce("расширение за границы дока: подложка рисуется слоем DragLayer");
+            return;
+        }
+
         int topPad = Math.max(0, topPadPx);
         int bottomPad = Math.max(0, bottomPadPx);
-        if (topPadPx < 0 || bottomPadPx < 0 || sideMarginPx < 0) {
-            logOnce("отрицательные отступы в режиме «фон дока» игнорируются — включи «свой слой»");
-        }
 
         int topInset = topPad + Math.max(0, offsetYPx);
         int bottomInset = bottomPad + Math.max(0, -offsetYPx);
@@ -714,6 +721,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         int lastMode = -1;
         boolean tickScheduled = false;
         long fastUntil = 0L;
+        boolean lastOverlay = false;
 
         float pendingAlpha = 1f;
         long lastSearchScan = 0L;
@@ -763,6 +771,11 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             }
         }
 
+        /** true — подложка рисуется в DragLayer (свободная геометрия и расширение). */
+        private boolean overlayMode() {
+            return mode == MODE_LAYER || overhangRequested();
+        }
+
         // ---------------------------------------------------------- кадр
 
         @Override
@@ -784,8 +797,18 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                     haveSignature = false;
                 }
 
-                if (mode != MODE_LAYER) {
-                    // режим «фон дока»: подложка живёт фоном Hotseat
+                boolean overlay = overlayMode();
+                if (overlay != lastOverlay) {
+                    lastOverlay = overlay;
+                    haveSignature = false;
+                    if (!overlay) {
+                        lastDrawnValid = false;
+                        container.invalidate();   // стереть то, что рисовал слой
+                    }
+                }
+
+                if (!overlay) {
+                    // подложка живёт фоном Hotseat (не выходит за его границы)
                     View hs = hotseatRef.get();
                     if (hs != null) updateHotseatBackground(hs);
                     visible = false;
@@ -830,7 +853,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 tickScheduled = false;
                 try {
                     if (!registered) return;
-                    if (mode != MODE_LAYER) {
+                    if (!overlayMode()) {
                         View hs = hotseatRef.get();
                         if (hs != null) updateHotseatBackground(hs);
                     } else if (updateGeometry()) {
@@ -900,13 +923,14 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             h = 31 * h + 41 * strokeWidthPx + 43 * strokeAlpha + (strokeLighten ? 47 : 0);
             h = 31 * h + (frosted ? 1 : 0) + 3 * frostAlpha + 5 * frostRadius
                     + 7 * frostOffsetX + 11 * frostOffsetY + 53 * frostSaturation;
+            h = 31 * h + (overlayMode() ? 1 : 0);
             return h;
         }
 
         /** Рисуется в контейнер до его детей: в режиме «свой слой» — под всем контентом. */
         void drawOn(Canvas canvas) {
             try {
-                if (mode != MODE_LAYER || !visible || rect.width() <= 0.5f || rect.height() <= 0.5f) {
+                if (!overlayMode() || !visible || rect.width() <= 0.5f || rect.height() <= 0.5f) {
                     lastDrawnValid = false;
                     return;
                 }
@@ -941,36 +965,47 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             float a = effectiveAlpha(hs);
             if (a < 0.05f) return false;
 
-            View search = findSearchView();
+            RectF base = new RectF();
+            float left;
+            float right;
+            float topExtra = 0f;
 
-            RectF dockBox = new RectF();
-            if (!unionChildren(hs, search, dockBox)) {
-                if (!visualBounds(hs, dockBox)) return false;
-            }
-            if (dockBox.width() <= 1f || dockBox.height() <= 1f) return false;
-            if (dockBox.centerY() < H * 0.55f) return false;   // док должен быть в нижней части экрана
-
-            // отступы могут быть отрицательными — тогда подложка расширяется за границы дока
-            float top = dockBox.top - topPadPx;
-            float bottom = dockBox.bottom + bottomPadPx;
-
-            if (includeSearch && search != null) {
-                RectF sBox = new RectF();
-                if (search.getVisibility() == View.VISIBLE
-                        && visualBounds(search, sBox)
-                        && sBox.height() > 1f
-                        && sBox.bottom <= dockBox.top + 32f
-                        && sBox.centerY() > H * 0.45f) {
-                    top = Math.min(top, sBox.top - topPadPx);
+            if (mode == MODE_LAYER) {
+                // «свой слой»: база — ряд иконок дока (+ строка поиска, если включена)
+                View search = findSearchView();
+                if (!unionChildren(hs, search, base)) {
+                    if (!visualBounds(hs, base)) return false;
                 }
+                if (includeSearch && search != null) {
+                    RectF sBox = new RectF();
+                    if (search.getVisibility() == View.VISIBLE
+                            && visualBounds(search, sBox)
+                            && sBox.height() > 1f
+                            && sBox.bottom <= base.top + 32f
+                            && sBox.centerY() > H * 0.45f) {
+                        base.top = Math.min(base.top, sBox.top);
+                    }
+                }
+                float margin = clamp(sideMarginPx, -600, Math.max(0, W / 2 - 8));
+                left = margin;
+                right = W - margin;
+            } else {
+                // стандартный режим с расширением: база — сам док (строка поиска внутри него)
+                View search = findSearchView();
+                if (!visualBounds(hs, base)) return false;
+                if (!includeSearch && search != null && search.getHeight() > 0) {
+                    topExtra = Math.round(search.getTop() + search.getTranslationY()) + search.getHeight();
+                }
+                left = base.left + sideMarginPx;
+                right = base.right - sideMarginPx;
             }
 
-            top += offsetYPx;
-            bottom += offsetYPx;
+            if (base.width() <= 1f || base.height() <= 1f) return false;
+            if (base.centerY() < H * 0.55f) return false;   // док должен быть в нижней части экрана
 
-            float margin = clamp(sideMarginPx, -200, Math.max(0, W / 2 - 8));
-            float left = margin;
-            float right = W - margin;
+            // Плюс = внутрь (подложка меньше), минус = наружу (расширение).
+            float top = base.top + topExtra + topPadPx + Math.max(0, offsetYPx);
+            float bottom = base.bottom - bottomPadPx - Math.max(0, -offsetYPx);
 
             top = Math.max(top, 0f);
             bottom = Math.min(bottom, H);
@@ -1343,9 +1378,9 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             else if ("dock_keep_original_bg".equals(k)) keepOriginalBg = bool(v);
             else if ("dock_include_search".equals(k)) includeSearch = bool(v);
             else if ("dock_radius_px".equals(k)) radiusPx = clamp(intOf(v, radiusPx), 0, 200);
-            else if ("dock_side_margin_px".equals(k)) sideMarginPx = clamp(intOf(v, sideMarginPx), -200, 200);
-            else if ("dock_top_pad_px".equals(k)) topPadPx = clamp(intOf(v, topPadPx), -200, 200);
-            else if ("dock_bottom_pad_px".equals(k)) bottomPadPx = clamp(intOf(v, bottomPadPx), -200, 200);
+            else if ("dock_side_margin_px".equals(k)) sideMarginPx = clamp(intOf(v, sideMarginPx), -600, 600);
+            else if ("dock_top_pad_px".equals(k)) topPadPx = clamp(intOf(v, topPadPx), -600, 600);
+            else if ("dock_bottom_pad_px".equals(k)) bottomPadPx = clamp(intOf(v, bottomPadPx), -600, 600);
             else if ("dock_offset_y_px".equals(k)) offsetYPx = clamp(intOf(v, offsetYPx), -400, 400);
             else if ("dock_alpha".equals(k)) alpha = clamp(intOf(v, alpha), 0, 255);
             else if ("dock_color_mode".equals(k)) colorMode = clamp(intOf(v, colorMode), 0, 6);
