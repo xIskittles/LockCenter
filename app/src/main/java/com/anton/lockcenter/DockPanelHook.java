@@ -86,19 +86,19 @@ public class DockPanelHook implements IXposedHookLoadPackage {
     static volatile int mode = MODE_BACKGROUND;
     static volatile boolean keepOriginalBg = false;
     static volatile boolean includeSearch = true;
-    static volatile int radiusPx = 44;
-    static volatile int sideMarginPx = 10;
-    static volatile int topPadPx = 6;
-    static volatile int bottomPadPx = 6;
+    static volatile int radiusPx = 95;
+    static volatile int sideMarginPx = 50;
+    static volatile int topPadPx = -8;
+    static volatile int bottomPadPx = 145;
     static volatile int offsetYPx = 0;
     static volatile int alpha = 70;
-    static volatile int colorMode = 0;          // 0 = вручную, 1..6 = системные цвета Material You
+    static volatile int colorMode = 2;          // 0 = вручную, 1..6 = системные цвета Material You
     static volatile int colorR = 255;
     static volatile int colorG = 255;
     static volatile int colorB = 255;
-    static volatile int strokeWidthPx = 1;      // толщина обводки, 0 = выключена
+    static volatile int strokeWidthPx = 0;      // толщина обводки, 0 = выключена
     static volatile int strokeAlpha = 40;       // прозрачность обводки
-    static volatile boolean strokeLighten = true;
+    static volatile boolean strokeLighten = false;
     static volatile boolean frosted = false;
     static volatile int frostRadius = 24;
     static volatile int frostAlpha = 150;
@@ -165,7 +165,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             log("класс Hotseat не найден в " + pkg + " — док-панель отключена");
             return;
         }
-        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v5)");
+        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v6)");
 
         XposedBridge.hookAllConstructors(hotseatClass, new XC_MethodHook() {
             @Override
@@ -721,6 +721,10 @@ public class DockPanelHook implements IXposedHookLoadPackage {
 
         final RectF rect = new RectF();
         final RectF lastDrawn = new RectF();
+        final RectF targetRect = new RectF();
+        final RectF shownRect = new RectF();
+        float shownAlpha = 0f;
+        long lastSmoothTime = 0L;
 
         boolean registered = false;
         boolean visible = false;
@@ -840,11 +844,39 @@ public class DockPanelHook implements IXposedHookLoadPackage {
 
         /**
          * Пересчитывает геометрию и, если она изменилась, просит перерисовку.
-         * Возвращает true, если что-то поменялось.
+         * Всё сглаживается по времени (~110 мс), поэтому резкие события — иконки
+         * в доке спрятались, меню приложений накрыло док — не рубят панель,
+         * а плавно её гасят.
          */
         private boolean updateGeometry() {
-            visible = computeRect(rect);
-            int sig = visible ? signature() : 0;
+            long now = System.currentTimeMillis();
+            float dt = (lastSmoothTime == 0L) ? 16f : clampF(now - lastSmoothTime, 4f, 200f);
+            lastSmoothTime = now;
+            float k = clampF(dt / 110f, 0.04f, 1f);
+
+            boolean targetVisible = computeRect(targetRect);
+            float targetAlpha = targetVisible ? pendingAlpha : 0f;
+
+            if (targetVisible) {
+                if (shownRect.width() <= 1f) {
+                    // первый раз — без анимации
+                    shownRect.set(targetRect);
+                    shownAlpha = targetAlpha;
+                } else {
+                    lerpRect(shownRect, targetRect, k);
+                    shownAlpha += (targetAlpha - shownAlpha) * k;
+                }
+            } else {
+                // цели нет — плавно гасим то, что было нарисовано
+                shownAlpha += (0f - shownAlpha) * k;
+            }
+            rect.set(shownRect);
+
+            boolean visibleNow = shownAlpha > 0.02f && rect.width() > 1f && rect.height() > 1f;
+            pendingAlpha = clampF(shownAlpha, 0f, 1f);
+            visible = visibleNow;
+
+            int sig = visibleNow ? signature() : 0;
             if (!haveSignature || sig != lastSignature) {
                 haveSignature = true;
                 lastSignature = sig;
@@ -852,6 +884,13 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 return true;
             }
             return false;
+        }
+
+        private static void lerpRect(RectF cur, RectF target, float k) {
+            cur.left += (target.left - cur.left) * k;
+            cur.top += (target.top - cur.top) * k;
+            cur.right += (target.right - cur.right) * k;
+            cur.bottom += (target.bottom - cur.bottom) * k;
         }
 
         /**
