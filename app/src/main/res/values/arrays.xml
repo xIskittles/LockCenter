@@ -2,5 +2,7 @@
 <resources>
     <string-array name="xposedscope">
         <item>com.android.systemui</item>
+        <item>com.google.android.apps.nexuslauncher</item>
+        <item>com.android.launcher3</item>
     </string-array>
 </resources>
