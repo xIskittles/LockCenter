@@ -165,7 +165,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             log("класс Hotseat не найден в " + pkg + " — док-панель отключена");
             return;
         }
-        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v8)");
+        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v9)");
 
         XposedBridge.hookAllConstructors(hotseatClass, new XC_MethodHook() {
             @Override
@@ -651,21 +651,17 @@ public class DockPanelHook implements IXposedHookLoadPackage {
 
         // Свой Drawable вместо InsetDrawable: InsetDrawable отдаёт свои отступы как
         // padding фона, а View добавил бы их к своим — иконки дока могли бы съехать.
-        PanelDrawable panel = new PanelDrawable(hotseat, sideInset, topInset, sideInset, bottomInset);
-        Drawable result = panel;
-        if (keepOriginalBg) {
-            Drawable original = ORIGINAL_BG.get(hotseat);
-            if (original != null) {
-                result = new LayerDrawable(new Drawable[]{original, result});
-            }
-        }
+        // Подложку теперь рисует слой DragLayer (см. computeRect), поэтому здесь
+        // только прячем родной фон дока, чтобы он не перекрывал подложку.
+        Drawable result = keepOriginalBg
+                ? ORIGINAL_BG.get(hotseat)
+                : new android.graphics.drawable.ColorDrawable(0);
 
         try {
             hotseat.setBackground(result);
             APPLIED_BG.put(hotseat, result);
             APPLIED_BG_SIG.put(hotseat, sig);
-            log("фон дока применён: insets=" + sideInset + "/" + topInset + "/" + sideInset + "/" + bottomInset
-                    + " radius=" + radiusPx + " stroke=" + strokeWidthPx + "/" + strokeAlpha
+            log("родной фон дока скрыт (подложку рисует слой DragLayer): radius=" + radiusPx
                     + " color=" + describeColorMode() + " alpha=" + alpha + " frost=" + frosted);
         } catch (Throwable t) {
             logOnce("setBackground: " + t);
@@ -783,7 +779,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
          * режиме просто игнорируются, а не ломают привязку к доку.
          */
         private boolean overlayMode() {
-            return mode == MODE_LAYER;
+            return true;
         }
 
         // ---------------------------------------------------------- кадр
@@ -817,17 +813,11 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                     }
                 }
 
-                if (!overlay) {
-                    // подложка живёт фоном Hotseat
+                // В обычном режиме прячем родной фон дока: подложку рисует слой
+                // DragLayer (иначе её обрезало бы по границам вью дока).
+                if (mode == MODE_BACKGROUND) {
                     View hs = hotseatRef.get();
-                    if (hs != null) {
-                        updateHotseatBackground(hs);
-                        invalidateOverflow(hs);
-                    }
-                    visible = false;
-                    lastDrawnValid = false;
-                    if (modeChanged) container.invalidate();
-                    return true;
+                    if (hs != null) updateHotseatBackground(hs);
                 }
 
                 if (updateGeometry()) {
@@ -868,13 +858,11 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 tickScheduled = false;
                 try {
                     if (!registered) return;
-                    if (!overlayMode()) {
+                    if (mode == MODE_BACKGROUND) {
                         View hs = hotseatRef.get();
-                        if (hs != null) {
-                            updateHotseatBackground(hs);
-                            invalidateOverflow(hs);
-                        }
-                    } else if (updateGeometry()) {
+                        if (hs != null) updateHotseatBackground(hs);
+                    }
+                    if (updateGeometry()) {
                         fastUntil = System.currentTimeMillis() + 800L;
                     }
                 } catch (Throwable t) {
@@ -1040,7 +1028,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             } else {
                 // стандартный режим с расширением: база — сам док (строка поиска внутри него)
                 View search = findSearchView();
-                if (!visualBounds(hs, base)) return false;
+                if (!dockBounds(hs, base)) return false;
                 if (!includeSearch && search != null && search.getHeight() > 0) {
                     topExtra = Math.round(search.getTop() + search.getTranslationY()) + search.getHeight();
                 }
@@ -1065,7 +1053,12 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             if (right - left < 16f || bottom - top < 8f) return false;
 
             out.set(left, top, right, bottom);
-            pendingAlpha = a * iconsAlpha(hs) * (1f - openP);
+            // прозрачность = прозрачность дока (то есть панель гаснет ровно вместе с ним);
+            // в меню приложений гасим заранее, но только на второй половине жеста,
+            // чтобы движение не отрывалось от дока
+            float lateFade = clampF((openP - 0.35f) / 0.5f, 0f, 1f);
+            float iconsFactor = iconsAlpha(hs) > 0.02f ? 1f : 0f;
+            pendingAlpha = a * iconsFactor * (1f - lateFade);
             if (pendingAlpha < 0.05f) return false;
             return true;
         }
@@ -1125,6 +1118,38 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 }
             }
             return found;
+        }
+
+        /**
+         * Точные границы дока с учётом переноса и масштаба (масштаб применяется
+         * вокруг pivot), в координатах контейнера. Именно так подложка повторяет
+         * анимации дока кадр в кадр.
+         */
+        private boolean dockBounds(View hs, RectF out) {
+            if (!hs.isAttachedToWindow() || !container.isAttachedToWindow()) return false;
+            try {
+                int[] a = new int[2];
+                int[] b = new int[2];
+                hs.getLocationInWindow(a);
+                container.getLocationInWindow(b);
+                float l = a[0] - b[0];
+                float t = a[1] - b[1];
+                float sx = hs.getScaleX();
+                float sy = hs.getScaleY();
+                float px = hs.getPivotX();
+                float py = hs.getPivotY();
+                float w = hs.getWidth();
+                float h = hs.getHeight();
+                if (w <= 0f || h <= 0f) return false;
+                float x0 = l + px + (0f - px) * sx;
+                float y0 = t + py + (0f - py) * sy;
+                float x1 = l + px + (w - px) * sx;
+                float y1 = t + py + (h - py) * sy;
+                out.set(Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1));
+                return out.width() > 1f && out.height() > 1f;
+            } catch (Throwable e) {
+                return false;
+            }
         }
 
         private boolean visualBounds(View v, RectF out) {
