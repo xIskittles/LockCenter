@@ -585,6 +585,9 @@ public class DockPanelHook implements IXposedHookLoadPackage {
     private static final Set<View> ORIGINAL_BG_SAVED =
             Collections.newSetFromMap(new WeakHashMap<View, Boolean>());
 
+    /** Время последнего setBackground — защита от мигания во время анимаций. */
+    private static volatile long lastBgApplyTime = 0L;
+
     static void updateHotseatBackground(View hotseat) {
         if (hotseat == null) return;
         if (mode != MODE_BACKGROUND || !enabled) {
@@ -601,14 +604,28 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             return;
         }
 
+        // Не дёргаем фон чаще, чем раз в 150 мс: иначе во время системных анимаций
+        // setBackground вызывает мигание (подложка «пропадает и появляется»).
+        long now = System.currentTimeMillis();
+        if (prevSig != null && now - lastBgApplyTime < 150L) return;
+
         if (!ORIGINAL_BG_SAVED.contains(hotseat)) {
             ORIGINAL_BG_SAVED.add(hotseat);
             ORIGINAL_BG.put(hotseat, hotseat.getBackground());
         }
 
-        // отрицательные отступы = подложка выходит за границы дока (расширение)
-        int topInset = topPadPx + Math.max(0, offsetYPx);
-        int bottomInset = bottomPadPx + Math.max(0, -offsetYPx);
+        // ВАЖНО: в режиме «фон дока» подложка живёт внутри границ Hotseat.
+        // Отрицательные отступы (расширение за границы дока) система обрезает
+        // во время анимаций — отсюда «пропадающая полоса» сверху. Для расширения
+        // есть режим «свой слой».
+        int topPad = Math.max(0, topPadPx);
+        int bottomPad = Math.max(0, bottomPadPx);
+        if (topPadPx < 0 || bottomPadPx < 0 || sideMarginPx < 0) {
+            logOnce("отрицательные отступы в режиме «фон дока» игнорируются — включи «свой слой»");
+        }
+
+        int topInset = topPad + Math.max(0, offsetYPx);
+        int bottomInset = bottomPad + Math.max(0, -offsetYPx);
 
         if (!includeSearch) {
             // подложка должна начинаться под строкой поиска (она — ребёнок Hotseat)
@@ -619,7 +636,8 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             }
         }
 
-        int sideInset = sideMarginPx;
+        int sideInset = Math.max(0, sideMarginPx);
+        lastBgApplyTime = now;
 
         // Свой Drawable вместо InsetDrawable: InsetDrawable отдаёт свои отступы как
         // padding фона, а View добавил бы их к своим — иконки дока могли бы съехать.
@@ -666,9 +684,13 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 + 7 * frostOffsetX + 11 * frostOffsetY + 53 * frostSaturation;
         h = 31 * h + (includeSearch ? 1 : 0) + (keepOriginalBg ? 2 : 0);
         h = 31 * h + hotseat.getWidth() + 3 * hotseat.getHeight() + 5 * hotseat.getPaddingTop();
-        View qsb = readSearchView(hotseat);
-        if (qsb != null) {
-            h = 31 * h + qsb.getHeight() + 3 * qsb.getTop() + 5 * Math.round(qsb.getTranslationY());
+        if (!includeSearch) {
+            // метрики строки поиска важны только когда подложка начинается под ней;
+            // в остальных случаях они меняются во время анимаций и вызывают мигание
+            View qsb = readSearchView(hotseat);
+            if (qsb != null) {
+                h = 31 * h + qsb.getHeight() + 3 * qsb.getTop();
+            }
         }
         return h;
     }
@@ -690,6 +712,8 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         boolean haveSignature = false;
         int lastSignature = 0;
         int lastMode = -1;
+        boolean tickScheduled = false;
+        long fastUntil = 0L;
 
         float pendingAlpha = 1f;
         long lastSearchScan = 0L;
@@ -718,9 +742,11 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             } catch (Throwable t) {
                 log("start: " + t);
             }
+            scheduleTick();
         }
 
         void stop() {
+            stopTick();
             if (!registered) return;
             try {
                 container.getViewTreeObserver().removeOnPreDrawListener(this);
@@ -768,18 +794,75 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                     return true;
                 }
 
-                visible = computeRect(rect);
-
-                int sig = visible ? signature() : 0;
-                if (!haveSignature || sig != lastSignature) {
-                    haveSignature = true;
-                    lastSignature = sig;
-                    invalidatePanel();
+                if (updateGeometry()) {
+                    fastUntil = System.currentTimeMillis() + 800L;
                 }
             } catch (Throwable t) {
                 logOnce("onPreDraw: " + t);
             }
             return true;
+        }
+
+        /**
+         * Пересчитывает геометрию и, если она изменилась, просит перерисовку.
+         * Возвращает true, если что-то поменялось.
+         */
+        private boolean updateGeometry() {
+            visible = computeRect(rect);
+            int sig = visible ? signature() : 0;
+            if (!haveSignature || sig != lastSignature) {
+                haveSignature = true;
+                lastSignature = sig;
+                invalidatePanel();
+                return true;
+            }
+            return false;
+        }
+
+        /**
+         * Тик вне кадра: успевает заметить изменение геометрии ДО того, как система
+         * посчитает область перерисовки. Без него верхняя часть подложки на кадр
+         * обрезалась во время анимаций (например, при сворачивании приложения).
+         */
+        private final Runnable tick = new Runnable() {
+            @Override
+            public void run() {
+                tickScheduled = false;
+                try {
+                    if (!registered) return;
+                    if (mode != MODE_LAYER) {
+                        View hs = hotseatRef.get();
+                        if (hs != null) updateHotseatBackground(hs);
+                    } else if (updateGeometry()) {
+                        fastUntil = System.currentTimeMillis() + 800L;
+                    }
+                } catch (Throwable t) {
+                    logOnce("tick: " + t);
+                }
+                scheduleTick();
+            }
+        };
+
+        private void scheduleTick() {
+            if (tickScheduled || !registered) return;
+            long now = System.currentTimeMillis();
+            long delay;
+            if (now < fastUntil) delay = 16L;
+            else if (container.isShown()) delay = 120L;
+            else delay = 1000L;
+            try {
+                tickScheduled = container.postDelayed(tick, delay);
+            } catch (Throwable t) {
+                tickScheduled = false;
+            }
+        }
+
+        private void stopTick() {
+            tickScheduled = false;
+            try {
+                container.removeCallbacks(tick);
+            } catch (Throwable ignored) {
+            }
         }
 
         private void invalidatePanel() {
@@ -797,7 +880,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 }
             }
             if (!has) return;
-            damage.inset(-12f, -12f);
+            damage.inset(-24f, -24f);
             try {
                 container.invalidate((int) Math.floor(damage.left), (int) Math.floor(damage.top),
                         (int) Math.ceil(damage.right), (int) Math.ceil(damage.bottom));
