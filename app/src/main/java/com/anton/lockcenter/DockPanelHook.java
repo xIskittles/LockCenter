@@ -165,7 +165,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             log("класс Hotseat не найден в " + pkg + " — док-панель отключена");
             return;
         }
-        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v9)");
+        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v10)");
 
         XposedBridge.hookAllConstructors(hotseatClass, new XC_MethodHook() {
             @Override
@@ -594,6 +594,10 @@ public class DockPanelHook implements IXposedHookLoadPackage {
     private static final Set<View> ORIGINAL_BG_SAVED =
             Collections.newSetFromMap(new WeakHashMap<View, Boolean>());
 
+    /** Исходные height/bottomMargin/padding дока, чтобы вернуть всё как было. */
+    private static final Map<View, int[]> ORIGINAL_LP =
+            Collections.synchronizedMap(new WeakHashMap<View, int[]>());
+
     /** Время последнего setBackground — защита от мигания во время анимаций. */
     private static volatile long lastBgApplyTime = 0L;
 
@@ -602,10 +606,88 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         return topPadPx < 0 || bottomPadPx < 0 || sideMarginPx < 0;
     }
 
-    static void updateHotseatBackground(View hotseat) {
-        if (hotseat == null) return;
+    /**
+     * Отращивает док вверх/вниз на величину минусовых отступов, чтобы подложка
+     * (фон дока) не выходила за границы вью и не обрезалась. Иконки компенсируются
+     * padding'ом, поэтому визуально остаются на месте.
+     */
+    private static void applyDockGrowth(View hotseat) {
+        int growTop = Math.max(0, -topPadPx);
+        int growBottom = Math.max(0, -bottomPadPx);
+        try {
+            if (!(hotseat.getLayoutParams() instanceof ViewGroup.MarginLayoutParams)) return;
+            ViewGroup.MarginLayoutParams mlp = (ViewGroup.MarginLayoutParams) hotseat.getLayoutParams();
+            int[] orig = ORIGINAL_LP.get(hotseat);
+            if (orig == null) {
+                int baseHeight = mlp.height >= 0 ? mlp.height : hotseat.getHeight();
+                if (baseHeight <= 0) return;
+                orig = new int[]{baseHeight, mlp.bottomMargin,
+                        hotseat.getPaddingTop(), hotseat.getPaddingBottom()};
+                ORIGINAL_LP.put(hotseat, orig);
+            }
+            int wantHeight = orig[0] + growTop + growBottom;
+            int wantBottomMargin = orig[1] - growBottom;
+            int wantPadTop = orig[2] + growTop;
+            int wantPadBottom = orig[3] + growBottom;
+            if (mlp.height == wantHeight && mlp.bottomMargin == wantBottomMargin
+                    && hotseat.getPaddingTop() == wantPadTop
+                    && hotseat.getPaddingBottom() == wantPadBottom) {
+                return;
+            }
+            mlp.height = wantHeight;
+            mlp.bottomMargin = wantBottomMargin;
+            hotseat.setPadding(hotseat.getPaddingLeft(), wantPadTop,
+                    hotseat.getPaddingRight(), wantPadBottom);
+            hotseat.setLayoutParams(mlp);
+            log("док увеличен: вверх=" + growTop + ", вниз=" + growBottom + " (иконки на месте)");
+        } catch (Throwable t) {
+            logOnce("applyDockGrowth: " + t);
+        }
+    }
+
+    /** Возвращает доку исходный размер (когда подложка выключена или включён «свой слой»). */
+    private static void restoreDockGrowth(View hotseat) {
+        try {
+            int[] orig = ORIGINAL_LP.remove(hotseat);
+            if (orig == null) return;
+            if (hotseat.getLayoutParams() instanceof ViewGroup.MarginLayoutParams) {
+                ViewGroup.MarginLayoutParams mlp = (ViewGroup.MarginLayoutParams) hotseat.getLayoutParams();
+                mlp.height = orig[0];
+                mlp.bottomMargin = orig[1];
+                hotseat.setLayoutParams(mlp);
+            }
+            hotseat.setPadding(hotseat.getPaddingLeft(), orig[2], hotseat.getPaddingRight(), orig[3]);
+            log("размер дока возвращён как было");
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** Есть ли в доке хоть одна видимая иконка (строка поиска не считается). */
+    private static boolean iconsVisible(View hotseat) {
+        if (!(hotseat instanceof ViewGroup)) return true;
+        ViewGroup g = (ViewGroup) hotseat;
+        View search = readSearchView(hotseat);
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View ch = g.getChildAt(i);
+            if (ch.getVisibility() != View.VISIBLE) continue;
+            if (search != null && isSameOrDescendant(ch, search)) continue;
+            if (ch instanceof ViewGroup) {
+                ViewGroup cg = (ViewGroup) ch;
+                for (int j = 0; j < cg.getChildCount(); j++) {
+                    View leaf = cg.getChildAt(j);
+                    if (leaf.getVisibility() == View.VISIBLE && leaf.getWidth() > 0) return true;
+                }
+            } else if (ch.getWidth() > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void updateHotseatBackground(View hotseat) {        if (hotseat == null) return;
         if (mode != MODE_BACKGROUND || !enabled) {
             restoreHotseatBackground(hotseat);
+            restoreDockGrowth(hotseat);
             return;
         }
         if (!hotseat.isAttachedToWindow()) return;
@@ -628,11 +710,14 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             ORIGINAL_BG.put(hotseat, hotseat.getBackground());
         }
 
-        // Отрицательные отступы разрешены и в этом режиме: фон дока рисуется поверх
-        // границ вью. Тонкость одна — «вылезшая» полоса не попадает в область
-        // перерисовки дока, поэтому её нужно перерисовывать явно (invalidateOverflow).
-        int topPad = topPadPx;
-        int bottomPad = bottomPadPx;
+        // Минусовые отступы делаем не «поверх границ», а ростом самого дока:
+        // система обрезает фон по границам вью, поэтому док отращивается на нужную
+        // величину, а иконки остаются на месте (см. applyDockGrowth).
+        applyDockGrowth(hotseat);
+
+        // Внутрь — обычные отступы подложки; наружу — уже за счёт роста дока.
+        int topPad = Math.max(0, topPadPx);
+        int bottomPad = Math.max(0, bottomPadPx);
 
         int topInset = topPad + Math.max(0, offsetYPx);
         int bottomInset = bottomPad + Math.max(0, -offsetYPx);
@@ -646,22 +731,33 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             }
         }
 
-        int sideInset = sideMarginPx;
+        if (sideMarginPx < 0) {
+            logOnce("вбок наружу в обычном режиме нельзя (док во всю ширину) — используй «Альтернативный режим»");
+        }
+        int sideInset = Math.max(0, sideMarginPx);
         lastBgApplyTime = now;
 
         // Свой Drawable вместо InsetDrawable: InsetDrawable отдаёт свои отступы как
         // padding фона, а View добавил бы их к своим — иконки дока могли бы съехать.
-        // Подложку теперь рисует слой DragLayer (см. computeRect), поэтому здесь
-        // только прячем родной фон дока, чтобы он не перекрывал подложку.
-        Drawable result = keepOriginalBg
-                ? ORIGINAL_BG.get(hotseat)
-                : new android.graphics.drawable.ColorDrawable(0);
+        PanelDrawable panel = new PanelDrawable(hotseat, sideInset, topInset, sideInset, bottomInset);
+        Drawable result;
+        if (!iconsVisible(hotseat)) {
+            // иконки дока спрятаны (например, меню приложений) — подложку не показываем
+            result = keepOriginalBg
+                    ? ORIGINAL_BG.get(hotseat)
+                    : new android.graphics.drawable.ColorDrawable(0);
+        } else if (keepOriginalBg) {
+            Drawable original = ORIGINAL_BG.get(hotseat);
+            result = original != null ? new LayerDrawable(new Drawable[]{original, panel}) : panel;
+        } else {
+            result = panel;
+        }
 
         try {
             hotseat.setBackground(result);
             APPLIED_BG.put(hotseat, result);
             APPLIED_BG_SIG.put(hotseat, sig);
-            log("родной фон дока скрыт (подложку рисует слой DragLayer): radius=" + radiusPx
+            log("фон дока применён: insets=" + sideInset + "/" + topInset + "/" + sideInset + "/" + bottomInset + " рост=" + Math.max(0, -topPadPx) + "/" + Math.max(0, -bottomPadPx) + " radius=" + radiusPx
                     + " color=" + describeColorMode() + " alpha=" + alpha + " frost=" + frosted);
         } catch (Throwable t) {
             logOnce("setBackground: " + t);
@@ -772,14 +868,13 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         }
 
         /**
-         * true — подложка рисуется отдельным слоем в DragLayer (свободная геометрия,
-         * расширение за границы дока). В обычном режиме подложка — это фон самого
-         * дока, поэтому она идеально повторяет все системные анимации; в слой
-         * автоматически больше не переключаемся: отрицательные отступы в обычном
-         * режиме просто игнорируются, а не ломают привязку к доку.
+         * true — подложка рисуется отдельным слоем в DragLayer (режим «свой слой»).
+         * В обычном режиме подложка — фон самого дока; чтобы минусовые отступы не
+         * обрезались, сам док физически отращивается вверх/вниз (applyDockGrowth),
+         * а иконки при этом остаются на своих местах.
          */
         private boolean overlayMode() {
-            return true;
+            return mode == MODE_LAYER;
         }
 
         // ---------------------------------------------------------- кадр
@@ -813,12 +908,18 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                     }
                 }
 
-                // В обычном режиме прячем родной фон дока: подложку рисует слой
-                // DragLayer (иначе её обрезало бы по границам вью дока).
-                if (mode == MODE_BACKGROUND) {
+                if (!overlay) {
+                    // подложка живёт фоном Hotseat (док при этом отращивается,
+                    // чтобы минусовые отступы не обрезались)
                     View hs = hotseatRef.get();
                     if (hs != null) updateHotseatBackground(hs);
+                    visible = false;
+                    lastDrawnValid = false;
+                    if (modeChanged) container.invalidate();
+                    return true;
                 }
+                View hsLayer = hotseatRef.get();
+                if (hsLayer != null) restoreDockGrowth(hsLayer);
 
                 if (updateGeometry()) {
                     fastUntil = System.currentTimeMillis() + 800L;
@@ -858,11 +959,10 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 tickScheduled = false;
                 try {
                     if (!registered) return;
-                    if (mode == MODE_BACKGROUND) {
+                    if (!overlayMode()) {
                         View hs = hotseatRef.get();
                         if (hs != null) updateHotseatBackground(hs);
-                    }
-                    if (updateGeometry()) {
+                    } else if (updateGeometry()) {
                         fastUntil = System.currentTimeMillis() + 800L;
                     }
                 } catch (Throwable t) {
