@@ -165,7 +165,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             log("класс Hotseat не найден в " + pkg + " — док-панель отключена");
             return;
         }
-        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v4)");
+        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v5)");
 
         XposedBridge.hookAllConstructors(hotseatClass, new XC_MethodHook() {
             @Override
@@ -1013,7 +1013,11 @@ public class DockPanelHook implements IXposedHookLoadPackage {
 
             if (base.width() <= 1f || base.height() <= 1f) return false;
             if (base.centerY() < H * 0.55f) return false;   // док должен быть в нижней части экрана
-            if (coveredByDrawer(base, H)) return false;     // открыто меню приложений
+
+            // Прогресс открытия меню приложений: подложка гаснет вместе с фоном,
+            // а не пропадает рывком. Жёсткое скрытие — только как страховка.
+            float openP = drawerProgress(hs, a);
+            if (openP > 0.05f && coveredByDrawer(base, H)) return false;
 
             // Плюс = внутрь (подложка меньше), минус = наружу (расширение).
             float top = base.top + topExtra + topPadPx + Math.max(0, offsetYPx);
@@ -1024,9 +1028,44 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             if (right - left < 16f || bottom - top < 8f) return false;
 
             out.set(left, top, right, bottom);
-            pendingAlpha = a * iconsAlpha(hs);
+            pendingAlpha = a * iconsAlpha(hs) * (1f - openP);
             if (pendingAlpha < 0.05f) return false;
             return true;
+        }
+
+        /**
+         * Прогресс открытия меню приложений: 0 — закрыто, 1 — полностью открыто.
+         * Сигналы: системное размытие окна лаунчера (оно растёт ровно вместе с
+         * жестом) и уменьшение дока. По этому прогрессу подложка плавно гаснет —
+         * так же, как гаснут иконки, без рывка.
+         */
+        private float drawerProgress(View hs, float dockAlpha) {
+            float p = 0f;
+            try {
+                android.content.Context c = container.getContext();
+                if (c instanceof android.app.Activity) {
+                    android.view.WindowManager.LayoutParams lp =
+                            ((android.app.Activity) c).getWindow().getAttributes();
+                    int r = lp.getBlurBehindRadius();
+                    if (r > 0) p = clampF(r / 25f, 0f, 1f);
+                }
+            } catch (Throwable ignored) {
+            }
+            if (hs != null) {
+                float sx = Math.abs(hs.getScaleX());
+                if (sx > 0.01f && sx < 0.999f) {
+                    p = Math.max(p, clampF((1f - sx) * 4f, 0f, 1f));
+                }
+            }
+            float result = clampF(p, 0f, 1f);
+            boolean active = result > 0.02f;
+            if (active != drawerHiddenLogged) {
+                drawerHiddenLogged = active;
+                log(active
+                        ? "меню приложений открывается — подложка гаснет (прогресс " + Math.round(result * 100f) + "%)"
+                        : "меню приложений закрыто — подложка снова рисуется");
+            }
+            return result;
         }
 
         /** Объединение видимых детей (иконки дока). Строка поиска исключается. */
@@ -1231,21 +1270,11 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         /** Открытое меню приложений накрывает док — подложку не рисуем вообще. */
         private boolean coveredByDrawer(RectF dockBox, int screenH) {
             View apps = appsView();
-            boolean hidden;
-            if (apps == null || !apps.isShown() || apps.getAlpha() < 0.05f) {
-                hidden = false;
-            } else {
-                RectF box = new RectF();
-                hidden = visualBounds(apps, box)
-                        && box.height() > screenH * 0.5f
-                        && box.top < dockBox.centerY();
-            }
-            if (hidden != drawerHiddenLogged) {
-                drawerHiddenLogged = hidden;
-                log(hidden ? "меню приложений накрыло док — подложка скрыта"
-                        : "меню приложений закрыто — подложка снова рисуется");
-            }
-            return hidden;
+            if (apps == null || !apps.isShown() || apps.getAlpha() < 0.05f) return false;
+            RectF box = new RectF();
+            return visualBounds(apps, box)
+                    && box.height() > screenH * 0.5f
+                    && box.top < dockBox.centerY();
         }
     }
 
