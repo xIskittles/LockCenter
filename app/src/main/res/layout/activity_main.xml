@@ -38,11 +38,28 @@
                 android:layout_marginBottom="8dp" />
 
             <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_restart_launcher"
+                style="@style/Widget.Material3.Button"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Перезагрузить лаунчер (Root)"
+                app:icon="@android:drawable/ic_menu_rotate"
+                android:layout_marginBottom="8dp" />
+
+            <com.google.android.material.button.MaterialButton
                 android:id="@+id/btn_save"
                 style="@style/Widget.Material3.Button.TonalButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="Применить без перезагрузки"
+                android:layout_marginBottom="8dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_dump_launcher"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Диагностика: дамп лаунчера в лог"
                 android:layout_marginBottom="16dp" />
 
             <!-- Поля настроек создаются в MainActivity -->
