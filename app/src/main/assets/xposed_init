@@ -1,2 +1,3 @@
 com.anton.lockcenter.MainHook
 com.anton.lockcenter.DockPanelHook
+com.anton.lockcenter.SplitShadeHook
