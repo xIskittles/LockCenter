@@ -127,9 +127,9 @@ public class MainActivity extends AppCompatActivity {
         addSwitchRow(list, "Сохранять родной фон дока", dockKeepOriginalBg, v -> dockKeepOriginalBg = v);
         addSwitchRow(list, "Захватывать строку поиска", dockIncludeSearch, v -> dockIncludeSearch = v);
         addIntRow(list, "Закругление подложки (px)", 0, 200, dockRadiusPx, v -> dockRadiusPx = v);
-        addIntRow(list, "Боковой отступ (px, минус = шире)", -200, 200, dockSideMarginPx, v -> dockSideMarginPx = v);
-        addIntRow(list, "Отступ сверху (px, минус = выше)", -200, 200, dockTopPadPx, v -> dockTopPadPx = v);
-        addIntRow(list, "Отступ снизу (px, минус = ниже)", -200, 200, dockBottomPadPx, v -> dockBottomPadPx = v);
+        addIntRow(list, "Боковой отступ (px, минус = шире)", -600, 600, dockSideMarginPx, v -> dockSideMarginPx = v);
+        addIntRow(list, "Отступ сверху (px, минус = выше)", -600, 600, dockTopPadPx, v -> dockTopPadPx = v);
+        addIntRow(list, "Отступ снизу (px, минус = ниже)", -600, 600, dockBottomPadPx, v -> dockBottomPadPx = v);
         addIntRow(list, "Сдвиг по вертикали (px)", -250, 250, dockOffsetYPx, v -> dockOffsetYPx = v);
 
         addSectionHeader(list, "Обводка подложки");
@@ -198,6 +198,78 @@ public class MainActivity extends AppCompatActivity {
             sendBroadcast(intent);
             Toast.makeText(this, "Дамп отправлен. Смотрите логи LSPosed (фильтр LockCenter).", Toast.LENGTH_LONG).show();
         });
+
+        LinearLayout container = findViewById(R.id.container);
+        MaterialButton btnSysDump = new MaterialButton(this);
+        btnSysDump.setText("Дамп SystemUI в Downloads (Root)");
+        btnSysDump.setOnClickListener(v -> {
+            Toast.makeText(this, "Собираю дамп SystemUI, подожди ~30 секунд...", Toast.LENGTH_LONG).show();
+            dumpSystemUiToDownloads();
+        });
+        container.addView(btnSysDump, 0);
+
+        MaterialButton btnDualOn = new MaterialButton(this);
+        btnDualOn.setText("Раздельный шейд: ВКЛЮЧИТЬ (эксперимент)");
+        btnDualOn.setOnClickListener(v -> runShell(
+                "aflags enable com.android.systemui.scene_container --immediate; "
+                        + "aflags enable com.android.systemui.dual_shade --immediate; "
+                        + "settings put secure dual_shade 1; "
+                        + "pkill -f com.android.systemui",
+                "Включаю раздельный шейд, SystemUI перезапустится..."));
+        container.addView(btnDualOn, 1);
+
+        MaterialButton btnDualOff = new MaterialButton(this);
+        btnDualOff.setText("Раздельный шейд: ВЫКЛЮЧИТЬ (как было)");
+        btnDualOff.setOnClickListener(v -> runShell(
+                "settings put secure dual_shade 0; "
+                        + "aflags disable com.android.systemui.dual_shade --immediate; "
+                        + "aflags disable com.android.systemui.scene_container --immediate; "
+                        + "pkill -f com.android.systemui",
+                "Возвращаю обычный шейд, SystemUI перезапустится..."));
+        container.addView(btnDualOff, 2);
+    }
+
+    /** Выполняет root-команду и показывает результат. */
+    private void runShell(String cmd, String toastText) {
+        Toast.makeText(this, toastText, Toast.LENGTH_LONG).show();
+        new Thread(() -> {
+            String msg;
+            try {
+                Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
+                p.waitFor();
+                msg = "Команда выполнена. Если ничего не изменилось — перезагрузи телефон (или пришли лог: su -c aflags list)";
+            } catch (Throwable t) {
+                msg = "Ошибка: " + t;
+            }
+            final String text = msg;
+            runOnUiThread(() -> Toast.makeText(this, text, Toast.LENGTH_LONG).show());
+        }).start();
+    }
+
+    /** Запускает root-скрипт из assets: собирает дамп SystemUI в папку Downloads. */
+    private void dumpSystemUiToDownloads() {
+        new Thread(() -> {
+            String msg;
+            try {
+                java.io.InputStream in = getAssets().open("dump_systemui.sh");
+                java.io.File out = new java.io.File(getFilesDir(), "dump_systemui.sh");
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(out);
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    fos.write(buf, 0, n);
+                }
+                fos.close();
+                in.close();
+                Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", "sh " + out.getAbsolutePath()});
+                p.waitFor();
+                msg = "Готово! Файл в папке Downloads: lockcenter_systemui_dump.txt";
+            } catch (Throwable t) {
+                msg = "Ошибка дампа: " + t;
+            }
+            final String text = msg;
+            runOnUiThread(() -> Toast.makeText(this, text, Toast.LENGTH_LONG).show());
+        }).start();
     }
 
     private synchronized void saveConfigSync() {
@@ -518,11 +590,12 @@ public class MainActivity extends AppCompatActivity {
         DESC.put("Закругление подложки (px)",
                 "Радиус углов. Для стиля Material 3 Expressive попробуй 70–110.");
         DESC.put("Боковой отступ (px, минус = шире)",
-                "Больше — подложка уже. 0 — от края до края. Отрицательное значение расширяет её за границы дока.");
+                "0 — от края до края. Плюс — подложка уже, минус — шире дока. Диапазон ±600 px.");
         DESC.put("Отступ сверху (px, минус = выше)",
-                "Запас над иконками и строкой поиска. Отрицательное значение поднимает верхний край выше — попробуй -30…-80.");
+                "Плюс — верхний край ниже, минус — выше дока (до 600 px). Минус работает и в стандартном "
+                        + "режиме: тогда подложку рисует слой DragLayer, поэтому обрезки по краю дока нет.");
         DESC.put("Отступ снизу (px, минус = ниже)",
-                "Запас под иконками. Отрицательное значение опускает нижний край ниже.");
+                "Плюс — нижний край выше, минус — ниже дока (до 600 px). Так можно растянуть подложку вниз.");
         DESC.put("Сдвиг по вертикали (px)",
                 "Сдвигает всю подложку вверх (минус) или вниз (плюс), не меняя её высоту.");
 
