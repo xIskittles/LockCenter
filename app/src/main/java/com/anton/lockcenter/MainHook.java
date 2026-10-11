@@ -4,6 +4,11 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.res.Configuration;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
@@ -27,7 +32,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class MainHook implements IXposedHookLoadPackage {
 
-    // Твои идеальные значения по умолчанию
+    // ======== НАСТРОЙКИ ЭКРАНА БЛОКИРОВКИ ========
     public static volatile float clockScaleX = 1.60f;
     public static volatile float clockScaleY = 1.30f;
     public static volatile int dateExtraGapPx = -20;
@@ -37,6 +42,14 @@ public class MainHook implements IXposedHookLoadPackage {
     public static volatile float largeClockScaleY = 1.05f;
     public static volatile int cardTopMarginPx = -50;
     public static volatile int notifTopMarginPx = 0;
+
+    // ======== НАСТРОЙКИ ДОК-ПАНЕЛИ (PIXEL LAUNCHER) ========
+    public static volatile boolean dockEnabled = true;
+    public static volatile int dockRadius = 80;
+    public static volatile int dockMarginH = 35;
+    public static volatile int dockPaddingTop = 15;
+    public static volatile int dockPaddingBottom = 15;
+    public static volatile int dockAlpha = 35; // прозрачность в % (10 - 90)
 
     private static final int UNSET = -1;
     private static final int PARENT = 0;
@@ -53,8 +66,12 @@ public class MainHook implements IXposedHookLoadPackage {
     private static boolean receiverRegistered = false;
     private static long lastCheckTime = 0;
 
+    // Кисти для отрисовки дока
+    private static final Paint dockBgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private static final Paint dockStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private static final RectF dockRect = new RectF();
+
     public static void loadConfig(Context context) {
-        // 1. Из базы Settings.Global
         if (context != null) {
             try {
                 String cfg = Settings.Global.getString(context.getContentResolver(), "lockcenter_cfg");
@@ -65,7 +82,6 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {}
         }
 
-        // 2. Из файла конфигурации
         File f = new File("/data/user_de/0/com.android.systemui/lockcenter.conf");
         if (!f.exists()) f = new File("/data/data/com.android.systemui/lockcenter.conf");
         if (f.exists() && f.canRead()) {
@@ -102,12 +118,127 @@ public class MainHook implements IXposedHookLoadPackage {
             else if ("large_clock_scale_y".equals(k)) largeClockScaleY = Float.parseFloat(v);
             else if ("card_top_margin_px".equals(k)) cardTopMarginPx = Integer.parseInt(v);
             else if ("notif_top_margin_px".equals(k)) notifTopMarginPx = Integer.parseInt(v);
+            else if ("dock_enabled".equals(k)) dockEnabled = Boolean.parseBoolean(v);
+            else if ("dock_radius".equals(k)) dockRadius = Integer.parseInt(v);
+            else if ("dock_margin_h".equals(k)) dockMarginH = Integer.parseInt(v);
+            else if ("dock_padding_top".equals(k)) dockPaddingTop = Integer.parseInt(v);
+            else if ("dock_padding_bottom".equals(k)) dockPaddingBottom = Integer.parseInt(v);
+            else if ("dock_alpha".equals(k)) dockAlpha = Integer.parseInt(v);
         } catch (Throwable ignored) {}
     }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        if (!"com.android.systemui".equals(lpparam.packageName)) return;
+        if ("com.android.systemui".equals(lpparam.packageName)) {
+            initSystemUI(lpparam);
+        } else if ("com.google.android.apps.nexuslauncher".equals(lpparam.packageName)
+                || "com.android.launcher3".equals(lpparam.packageName)) {
+            initLauncher(lpparam);
+        }
+    }
+
+    // =========================================================================
+    //                            PIXEL LAUNCHER (DOCK)
+    // =========================================================================
+
+    private static void initLauncher(XC_LoadPackage.LoadPackageParam lpparam) {
+        ClassLoader cl = lpparam.classLoader;
+        Class<?> hotseatClass = XposedHelpers.findClassIfExists("com.android.launcher3.Hotseat", cl);
+        if (hotseatClass == null) return;
+
+        // Включаем отрисовку и слушаем настройки
+        XposedBridge.hookAllConstructors(hotseatClass, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                final View hotseat = (View) param.thisObject;
+                hotseat.setWillNotDraw(false);
+                loadConfig(hotseat.getContext());
+
+                try {
+                    IntentFilter filter = new IntentFilter("com.anton.lockcenter.UPDATE_SETTINGS");
+                    hotseat.getContext().registerReceiver(new BroadcastReceiver() {
+                        @Override
+                        public void onReceive(Context context, Intent intent) {
+                            loadConfig(context);
+                            hotseat.invalidate();
+                        }
+                    }, filter, Context.RECEIVER_EXPORTED);
+                } catch (Throwable ignored) {}
+            }
+        });
+
+        // Рисуем подложку ДО отрисовки иконок и поисковой строки
+        XposedHelpers.findAndHookMethod(hotseatClass, "dispatchDraw", Canvas.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                if (!dockEnabled) return;
+                Canvas canvas = (Canvas) param.args[0];
+                ViewGroup hotseat = (ViewGroup) param.thisObject;
+                drawIosDock(canvas, hotseat);
+            }
+        });
+    }
+
+    private static void drawIosDock(Canvas canvas, ViewGroup hotseat) {
+        int width = hotseat.getWidth();
+        int height = hotseat.getHeight();
+        if (width <= 0 || height <= 0 || width < height) return; // Пропускаем ландшафт
+
+        int childCount = hotseat.getChildCount();
+        int minTop = Integer.MAX_VALUE;
+        int maxBottom = Integer.MIN_VALUE;
+
+        // Находим реальные границы иконок и строки поиска внутри Hotseat
+        for (int i = 0; i < childCount; i++) {
+            View child = hotseat.getChildAt(i);
+            if (child.getVisibility() == View.VISIBLE && child.getHeight() > 0) {
+                minTop = Math.min(minTop, child.getTop());
+                maxBottom = Math.max(maxBottom, child.getBottom());
+            }
+        }
+
+        if (minTop >= maxBottom) {
+            minTop = hotseat.getPaddingTop();
+            maxBottom = height - hotseat.getPaddingBottom();
+        }
+
+        float left = dockMarginH;
+        float right = width - dockMarginH;
+        float top = minTop - dockPaddingTop;
+        float bottom = maxBottom + dockPaddingBottom;
+
+        if (left >= right || top >= bottom) return;
+
+        dockRect.set(left, top, right, bottom);
+
+        boolean isDark = (hotseat.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+        int alpha255 = Math.round((dockAlpha / 100f) * 255);
+
+        // Матовый полупрозрачный фон (как на iOS)
+        dockBgPaint.setStyle(Paint.Style.FILL);
+        if (isDark) {
+            dockBgPaint.setColor(Color.argb(alpha255, 38, 42, 46));
+        } else {
+            dockBgPaint.setColor(Color.argb(alpha255, 255, 255, 255));
+        }
+        canvas.drawRoundRect(dockRect, dockRadius, dockRadius, dockBgPaint);
+
+        // Тонкий стеклянный кант по контуру
+        dockStrokePaint.setStyle(Paint.Style.STROKE);
+        dockStrokePaint.setStrokeWidth(2f);
+        if (isDark) {
+            dockStrokePaint.setColor(Color.argb(Math.min(255, alpha255 + 25), 255, 255, 255));
+        } else {
+            dockStrokePaint.setColor(Color.argb(Math.min(255, alpha255 + 20), 0, 0, 0));
+        }
+        canvas.drawRoundRect(dockRect, dockRadius, dockRadius, dockStrokePaint);
+    }
+
+    // =========================================================================
+    //                            SYSTEM UI (LOCKSCREEN)
+    // =========================================================================
+
+    private static void initSystemUI(XC_LoadPackage.LoadPackageParam lpparam) {
         ClassLoader cl = lpparam.classLoader;
 
         loadConfig(null);
@@ -147,15 +278,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 public void onReceive(Context ctx, Intent intent) {
                     if (intent != null) {
-                        clockScaleX = intent.getFloatExtra("clock_scale_x", clockScaleX);
-                        clockScaleY = intent.getFloatExtra("clock_scale_y", clockScaleY);
-                        dateExtraGapPx = intent.getIntExtra("date_extra_gap_px", dateExtraGapPx);
-                        dateScaleX = intent.getFloatExtra("date_scale_x", dateScaleX);
-                        dateScaleY = intent.getFloatExtra("date_scale_y", dateScaleY);
-                        largeClockScaleX = intent.getFloatExtra("large_clock_scale_x", largeClockScaleX);
-                        largeClockScaleY = intent.getFloatExtra("large_clock_scale_y", largeClockScaleY);
-                        cardTopMarginPx = intent.getIntExtra("card_top_margin_px", cardTopMarginPx);
-                        notifTopMarginPx = intent.getIntExtra("notif_top_margin_px", notifTopMarginPx);
+                        loadConfig(ctx);
                     }
                 }
             }, filter, Context.RECEIVER_EXPORTED);
@@ -257,7 +380,6 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-    /** Контроль вертикального сдвига даты */
     private static void hookDateTranslationY(ClassLoader cl) {
         Class<?> viewClass = XposedHelpers.findClass("android.view.View", cl);
         XposedBridge.hookAllMethods(viewClass, "setTranslationY", new XC_MethodHook() {
@@ -272,12 +394,10 @@ public class MainHook implements IXposedHookLoadPackage {
                 ViewGroup root = (ViewGroup) parent;
                 View smallClock = findSmallClock(root);
 
-                // Если активны маленькие часы (есть уведомления)
                 if (smallClock != null && smallClock.getVisibility() == View.VISIBLE && smallClock.getAlpha() > 0.05f) {
                     float clockTy = smallClock.getTranslationY();
                     param.args[0] = clockTy + (float) dateExtraGapPx;
                 }
-                // В режиме больших часов не сбиваем дату вверх
             }
         });
     }
@@ -362,7 +482,6 @@ public class MainHook implements IXposedHookLoadPackage {
             attachClockScaler(clock);
         }
 
-        // 1. ДАТА (Чт, 8 окт.)
         if (dateView != null) {
             attachDateScaler(dateView);
 
@@ -370,7 +489,6 @@ public class MainHook implements IXposedHookLoadPackage {
                 dateView.setId(View.generateViewId());
             }
 
-            // Корректируем разметку даты только когда активны маленькие часы
             if (isSmallClockActive && clock != null) {
                 ViewGroup.LayoutParams lp = dateView.getLayoutParams();
                 if (lp != null) {
@@ -406,7 +524,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
 
-        // 2. КАРТОЧКА ФОНАРИКА (под датой)
         if (cardView != null && dateView != null) {
             if (cardView.getId() == View.NO_ID) {
                 cardView.setId(View.generateViewId());
@@ -428,14 +545,13 @@ public class MainHook implements IXposedHookLoadPackage {
 
                 if (lp instanceof ViewGroup.MarginLayoutParams) {
                     ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-                    m.topMargin = 12 + cardTopMarginPx; // Отступ фонарика из настроек
+                    m.topMargin = 12 + cardTopMarginPx;
                 }
 
                 apply(cardView, lp, root, inMeasure);
             }
         }
 
-        // 3. Точка привязки уведомлений (с регулируемым отступом)
         if (isSmallClockActive) {
             int anchorId = View.NO_ID;
             if (cardView != null && cardView.getVisibility() == View.VISIBLE && cardView.getHeight() > 0) {
@@ -488,7 +604,6 @@ public class MainHook implements IXposedHookLoadPackage {
         boolean isSmallClockActive = (clock != null && clock.getVisibility() == View.VISIBLE && clock.getAlpha() > 0.05f);
 
         if (isSmallClockActive) {
-            // --- РЕЖИМ МАЛЕНЬКИХ ЧАСОВ (уведомления есть) ---
             float clockTy = clock.getTranslationY();
 
             if (dateView != null && dateView.getVisibility() == View.VISIBLE) {
@@ -516,8 +631,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             }
         } else {
-            // --- РЕЖИМ БОЛЬШИХ ЧАСОВ (уведомлений нет) ---
-            // Дата не смещается вверх на -20px. Если большие часы увеличены — дата отодвигается вниз.
+            // Режим больших часов: отодвигаем дату вниз под увеличенные цифры
             if (dateView != null && dateView.getVisibility() == View.VISIBLE) {
                 float desiredDateTy = 0f;
                 if (largeClock != null && largeClock.getVisibility() == View.VISIBLE && largeClock.getHeight() > 0) {
@@ -630,7 +744,7 @@ public class MainHook implements IXposedHookLoadPackage {
         setInt(lp, "topToBottom", anchorId);
         if (lp instanceof ViewGroup.MarginLayoutParams) {
             ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-            m.topMargin = notifTopMarginPx; // Отступ уведомлений из настроек
+            m.topMargin = notifTopMarginPx;
         }
         apply(ph, lp, root, inMeasure);
     }
@@ -705,7 +819,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 try {
                                     int screenWidth = v.getResources().getDisplayMetrics().widthPixels;
                                     if (isShelf) {
-                                        centerShelf((ViewGroup) v, screenWidth);
+                                        centerShelf((ViewGroup) v);
                                     } else if (isAodContainer(v)) {
                                         centerAodIcons((ViewGroup) v, screenWidth);
                                     }
@@ -761,7 +875,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void centerShelf(ViewGroup shelf, int screenWidth) {
+    private static void centerShelf(ViewGroup shelf) {
         if (shelf.getVisibility() != View.VISIBLE || shelf.getWidth() == 0
                 || shelf.getAlpha() < 0.01f) return;
         View parent = (View) shelf.getParent();
