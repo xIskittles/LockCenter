@@ -14,6 +14,7 @@ import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 
 import com.google.android.material.button.MaterialButton;
+import com.google.android.material.materialswitch.MaterialSwitch;
 import com.google.android.material.slider.Slider;
 
 import java.io.File;
@@ -67,7 +68,7 @@ public class MainActivity extends AppCompatActivity {
         dockMarginH = prefs.getInt("dock_margin_h", 35);
         dockPaddingTop = prefs.getInt("dock_padding_top", 15);
         dockPaddingBottom = prefs.getInt("dock_padding_bottom", 15);
-        dockAlpha = prefs.getInt("dock_alpha", 35);
+        dockAlpha = prefs.getInt("dock_alpha", 40);
 
         LinearLayout list = findViewById(R.id.settings_list);
 
@@ -85,6 +86,7 @@ public class MainActivity extends AppCompatActivity {
 
         // Блок док-панели рабочего стола
         addHeader(list, "🍏 Док-панель (Pixel Launcher)");
+        addSwitchRow(list, "Включить док-подложку", dockEnabled, isChecked -> dockEnabled = isChecked);
         addIntRow(list, "Закругление углов дока (px)", 0, 150, dockRadius, v -> dockRadius = v);
         addIntRow(list, "Отступ дока по бокам (px)", 0, 120, dockMarginH, v -> dockMarginH = v);
         addIntRow(list, "Отступ сверху (над иконками, px)", -20, 80, dockPaddingTop, v -> dockPaddingTop = v);
@@ -141,6 +143,22 @@ public class MainActivity extends AppCompatActivity {
         tv.setTypeface(null, android.graphics.Typeface.BOLD);
         tv.setPadding(8, 28, 8, 16);
         parent.addView(tv);
+    }
+
+    private interface OnCheckedListener {
+        void onCheck(boolean isChecked);
+    }
+
+    private void addSwitchRow(LinearLayout parent, String title, boolean initial, OnCheckedListener listener) {
+        LinearLayout content = createCard(parent, title);
+        MaterialSwitch s = new MaterialSwitch(this);
+        s.setChecked(initial);
+        s.setText(initial ? "Включено" : "Выключено");
+        s.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            s.setText(isChecked ? "Включено" : "Выключено");
+            listener.onCheck(isChecked);
+        });
+        content.addView(s);
     }
 
     private String buildConfigString() {
@@ -203,10 +221,8 @@ public class MainActivity extends AppCompatActivity {
                 + "dock_alpha=" + dockAlpha + "\n";
 
         try {
-            // 1. Запись в системную базу Settings.Global
             Runtime.getRuntime().exec(new String[]{"su", "-c", "settings put global lockcenter_cfg \"" + cfgOneLine + "\""}).waitFor();
 
-            // 2. Запись в системный каталог SystemUI
             File localFile = new File(getFilesDir(), "lockcenter.conf");
             try (FileWriter fw = new FileWriter(localFile)) {
                 fw.write(fileContent);
