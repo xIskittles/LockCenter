@@ -20,7 +20,9 @@ import com.google.android.material.slider.Slider;
 
 import java.io.File;
 import java.io.FileWriter;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -51,12 +53,17 @@ public class MainActivity extends AppCompatActivity {
     private int dockBottomPadPx;
     private int dockOffsetYPx;
     private int dockAlpha;
+    private int dockColorMode;
     private int dockColorR;
     private int dockColorG;
     private int dockColorB;
+    private int dockStrokeWidthPx;
+    private int dockStrokeAlpha;
+    private boolean dockStrokeLighten;
     private boolean dockFrosted;
     private int dockFrostRadius;
     private int dockFrostAlpha;
+    private int dockFrostSaturation;
     private int dockFrostOffsetX;
     private int dockFrostOffsetY;
 
@@ -87,12 +94,17 @@ public class MainActivity extends AppCompatActivity {
         dockBottomPadPx = prefs.getInt("dock_bottom_pad_px", 6);
         dockOffsetYPx = prefs.getInt("dock_offset_y_px", 0);
         dockAlpha = prefs.getInt("dock_alpha", 70);
+        dockColorMode = prefs.getInt("dock_color_mode", 0);
         dockColorR = prefs.getInt("dock_color_r", 255);
         dockColorG = prefs.getInt("dock_color_g", 255);
         dockColorB = prefs.getInt("dock_color_b", 255);
+        dockStrokeWidthPx = prefs.getInt("dock_stroke_width_px", 1);
+        dockStrokeAlpha = prefs.getInt("dock_stroke_alpha", 40);
+        dockStrokeLighten = prefs.getBoolean("dock_stroke_lighten", true);
         dockFrosted = prefs.getBoolean("dock_frosted", false);
         dockFrostRadius = prefs.getInt("dock_frost_radius", 24);
         dockFrostAlpha = prefs.getInt("dock_frost_alpha", 150);
+        dockFrostSaturation = prefs.getInt("dock_frost_saturation", 130);
         dockFrostOffsetX = prefs.getInt("dock_frost_offset_x", 0);
         dockFrostOffsetY = prefs.getInt("dock_frost_offset_y", 0);
 
@@ -115,21 +127,28 @@ public class MainActivity extends AppCompatActivity {
         addSwitchRow(list, "Сохранять родной фон дока", dockKeepOriginalBg, v -> dockKeepOriginalBg = v);
         addSwitchRow(list, "Захватывать строку поиска", dockIncludeSearch, v -> dockIncludeSearch = v);
         addIntRow(list, "Закругление подложки (px)", 0, 200, dockRadiusPx, v -> dockRadiusPx = v);
-        addIntRow(list, "Боковой отступ от краёв (px)", 0, 200, dockSideMarginPx, v -> dockSideMarginPx = v);
-        addIntRow(list, "Отступ сверху (px)", 0, 200, dockTopPadPx, v -> dockTopPadPx = v);
-        addIntRow(list, "Отступ снизу (px)", 0, 200, dockBottomPadPx, v -> dockBottomPadPx = v);
+        addIntRow(list, "Боковой отступ (px, минус = шире)", -200, 200, dockSideMarginPx, v -> dockSideMarginPx = v);
+        addIntRow(list, "Отступ сверху (px, минус = выше)", -200, 200, dockTopPadPx, v -> dockTopPadPx = v);
+        addIntRow(list, "Отступ снизу (px, минус = ниже)", -200, 200, dockBottomPadPx, v -> dockBottomPadPx = v);
         addIntRow(list, "Сдвиг по вертикали (px)", -250, 250, dockOffsetYPx, v -> dockOffsetYPx = v);
 
-        addSectionHeader(list, "Цвет подложки");
-        addIntRow(list, "Прозрачность (0-255)", 0, 255, dockAlpha, v -> dockAlpha = v);
-        addIntRow(list, "Красный (R)", 0, 255, dockColorR, v -> dockColorR = v);
-        addIntRow(list, "Зелёный (G)", 0, 255, dockColorG, v -> dockColorG = v);
-        addIntRow(list, "Синий (B)", 0, 255, dockColorB, v -> dockColorB = v);
+        addSectionHeader(list, "Обводка подложки");
+        addIntRow(list, "Толщина обводки (px, 0 = выкл)", 0, 16, dockStrokeWidthPx, v -> dockStrokeWidthPx = v);
+        addIntRow(list, "Прозрачность обводки (0-255)", 0, 255, dockStrokeAlpha, v -> dockStrokeAlpha = v);
+        addSwitchRow(list, "Обводка светлее подложки", dockStrokeLighten, v -> dockStrokeLighten = v);
 
-        addSectionHeader(list, "Матовое стекло (экспериментально)");
+        addSectionHeader(list, "Цвет подложки");
+        addIntRow(list, "Цвет как в системе (0-6)", 0, 6, dockColorMode, v -> dockColorMode = v);
+        addIntRow(list, "Прозрачность цвета (0-255)", 0, 255, dockAlpha, v -> dockAlpha = v);
+        addIntRow(list, "Красный (R, если 0)", 0, 255, dockColorR, v -> dockColorR = v);
+        addIntRow(list, "Зелёный (G, если 0)", 0, 255, dockColorG, v -> dockColorG = v);
+        addIntRow(list, "Синий (B, если 0)", 0, 255, dockColorB, v -> dockColorB = v);
+
+        addSectionHeader(list, "Матовое стекло (как системная прозрачность)");
         addSwitchRow(list, "Размытие обоев под подложкой", dockFrosted, v -> dockFrosted = v);
         addIntRow(list, "Сила размытия (px)", 0, 80, dockFrostRadius, v -> dockFrostRadius = v);
         addIntRow(list, "Непрозрачность стекла (0-255)", 0, 255, dockFrostAlpha, v -> dockFrostAlpha = v);
+        addIntRow(list, "Насыщенность стекла (%)", 0, 200, dockFrostSaturation, v -> dockFrostSaturation = v);
         addIntRow(list, "Смещение обоев по X (px)", -800, 800, dockFrostOffsetX, v -> dockFrostOffsetX = v);
         addIntRow(list, "Смещение обоев по Y (px)", -800, 800, dockFrostOffsetY, v -> dockFrostOffsetY = v);
 
@@ -202,12 +221,17 @@ public class MainActivity extends AppCompatActivity {
                 .putInt("dock_bottom_pad_px", dockBottomPadPx)
                 .putInt("dock_offset_y_px", dockOffsetYPx)
                 .putInt("dock_alpha", dockAlpha)
+                .putInt("dock_color_mode", dockColorMode)
                 .putInt("dock_color_r", dockColorR)
                 .putInt("dock_color_g", dockColorG)
                 .putInt("dock_color_b", dockColorB)
+                .putInt("dock_stroke_width_px", dockStrokeWidthPx)
+                .putInt("dock_stroke_alpha", dockStrokeAlpha)
+                .putBoolean("dock_stroke_lighten", dockStrokeLighten)
                 .putBoolean("dock_frosted", dockFrosted)
                 .putInt("dock_frost_radius", dockFrostRadius)
                 .putInt("dock_frost_alpha", dockFrostAlpha)
+                .putInt("dock_frost_saturation", dockFrostSaturation)
                 .putInt("dock_frost_offset_x", dockFrostOffsetX)
                 .putInt("dock_frost_offset_y", dockFrostOffsetY)
                 .apply();
@@ -232,12 +256,17 @@ public class MainActivity extends AppCompatActivity {
                 + ",dock_bottom_pad_px=" + dockBottomPadPx
                 + ",dock_offset_y_px=" + dockOffsetYPx
                 + ",dock_alpha=" + dockAlpha
+                + ",dock_color_mode=" + dockColorMode
                 + ",dock_color_r=" + dockColorR
                 + ",dock_color_g=" + dockColorG
                 + ",dock_color_b=" + dockColorB
+                + ",dock_stroke_width_px=" + dockStrokeWidthPx
+                + ",dock_stroke_alpha=" + dockStrokeAlpha
+                + ",dock_stroke_lighten=" + bool(dockStrokeLighten)
                 + ",dock_frosted=" + bool(dockFrosted)
                 + ",dock_frost_radius=" + dockFrostRadius
                 + ",dock_frost_alpha=" + dockFrostAlpha
+                + ",dock_frost_saturation=" + dockFrostSaturation
                 + ",dock_frost_offset_x=" + dockFrostOffsetX
                 + ",dock_frost_offset_y=" + dockFrostOffsetY;
 
@@ -260,12 +289,17 @@ public class MainActivity extends AppCompatActivity {
                 + "dock_bottom_pad_px=" + dockBottomPadPx + "\n"
                 + "dock_offset_y_px=" + dockOffsetYPx + "\n"
                 + "dock_alpha=" + dockAlpha + "\n"
+                + "dock_color_mode=" + dockColorMode + "\n"
                 + "dock_color_r=" + dockColorR + "\n"
                 + "dock_color_g=" + dockColorG + "\n"
                 + "dock_color_b=" + dockColorB + "\n"
+                + "dock_stroke_width_px=" + dockStrokeWidthPx + "\n"
+                + "dock_stroke_alpha=" + dockStrokeAlpha + "\n"
+                + "dock_stroke_lighten=" + bool(dockStrokeLighten) + "\n"
                 + "dock_frosted=" + bool(dockFrosted) + "\n"
                 + "dock_frost_radius=" + dockFrostRadius + "\n"
                 + "dock_frost_alpha=" + dockFrostAlpha + "\n"
+                + "dock_frost_saturation=" + dockFrostSaturation + "\n"
                 + "dock_frost_offset_x=" + dockFrostOffsetX + "\n"
                 + "dock_frost_offset_y=" + dockFrostOffsetY + "\n";
 
@@ -335,6 +369,16 @@ public class MainActivity extends AppCompatActivity {
         tv.setTypeface(null, android.graphics.Typeface.BOLD);
         tv.setPadding(8, 24, 8, 12);
         parent.addView(tv);
+
+        String desc = DESC.get(title);
+        if (desc != null) {
+            TextView sub = new TextView(this);
+            sub.setText(desc);
+            sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+            sub.setAlpha(0.7f);
+            sub.setPadding(8, 0, 8, 8);
+            parent.addView(sub);
+        }
     }
 
     private void addSwitchRow(LinearLayout parent, String title, boolean current, OnBoolChanged listener) {
@@ -435,6 +479,95 @@ public class MainActivity extends AppCompatActivity {
         content.addView(slider);
     }
 
+    /** Пояснения к каждому пункту настроек (показываются мелким текстом под заголовком). */
+    private static final Map<String, String> DESC = new HashMap<>();
+
+    static {
+        DESC.put("Экран блокировки (SystemUI)",
+                "Центрирование часов, даты и уведомлений на экране блокировки. Применяется к SystemUI.");
+        DESC.put("Ширина маленьких часов",
+                "Горизонтальный масштаб часов, когда есть уведомления. 1.00 — как в системе.");
+        DESC.put("Высота маленьких часов",
+                "Вертикальный масштаб маленьких часов. Меняй вместе с шириной, чтобы цифры не растягивались.");
+        DESC.put("Отступ даты от часов (px)",
+                "Сдвиг даты относительно часов: плюс — ниже, минус — выше.");
+        DESC.put("Ширина даты",
+                "Горизонтальный масштаб текста даты (например «Чт, 8 окт.»).");
+        DESC.put("Высота даты",
+                "Вертикальный масштаб даты.");
+        DESC.put("Ширина больших часов",
+                "Масштаб больших часов, когда уведомлений нет.");
+        DESC.put("Высота больших часов",
+                "Вертикальный масштаб больших часов.");
+        DESC.put("Отступ плашки фонарика от даты (px)",
+                "Расстояние между датой и карточкой «Самое главное» (фонарик, таймер, будильник).");
+        DESC.put("Отступ уведомлений от даты (px)",
+                "Дополнительный сдвиг иконок уведомлений вниз (плюс) или вверх (минус).");
+
+        DESC.put("Док-панель рабочего стола (Pixel Launcher)",
+                "Подложка под доком и строкой поиска. После изменений нажми «Применить без перезагрузки».");
+        DESC.put("Включить подложку дока",
+                "Главный выключатель. Выключишь — вернётся родной вид дока Google.");
+        DESC.put("Альтернативный режим (свой слой)",
+                "Выкл — подложка ставится фоном дока и идеально повторяет все системные анимации. "
+                        + "Вкл — рисуется отдельным слоем: свободнее с размером, сдвигом и расширением.");
+        DESC.put("Сохранять родной фон дока",
+                "Вкл — родной фон Google остаётся под нашей подложкой. Выкл — заменяется нашей.");
+        DESC.put("Захватывать строку поиска",
+                "Вкл — подложка накрывает и строку поиска Google. Выкл — только ряд иконок дока.");
+        DESC.put("Закругление подложки (px)",
+                "Радиус углов. Для стиля Material 3 Expressive попробуй 70–110.");
+        DESC.put("Боковой отступ (px, минус = шире)",
+                "Больше — подложка уже. 0 — от края до края. Отрицательное значение расширяет её за границы дока.");
+        DESC.put("Отступ сверху (px, минус = выше)",
+                "Запас над иконками и строкой поиска. Отрицательное значение поднимает верхний край выше — попробуй -30…-80.");
+        DESC.put("Отступ снизу (px, минус = ниже)",
+                "Запас под иконками. Отрицательное значение опускает нижний край ниже.");
+        DESC.put("Сдвиг по вертикали (px)",
+                "Сдвигает всю подложку вверх (минус) или вниз (плюс), не меняя её высоту.");
+
+        DESC.put("Обводка подложки",
+                "Тонкий контур по краю подложки — так выглядят поверхности в Material 3.");
+        DESC.put("Толщина обводки (px, 0 = выкл)",
+                "0 — обводки нет. 1–2 px — лёгкая рамка, 3+ px — заметный контур.");
+        DESC.put("Прозрачность обводки (0-255)",
+                "Насколько заметен контур. 20–60 — деликатно, 120+ — ярко.");
+        DESC.put("Обводка светлее подложки",
+                "Вкл — рамка светлее цвета подложки (эффект стеклянного края). Выкл — ровно цвет подложки.");
+
+        DESC.put("Цвет подложки",
+                "Цвет подложки: вручную (R/G/B) или из системной палитры Material You.");
+        DESC.put("Цвет как в системе (0-6)",
+                "0 — вручную, цвет берётся из R/G/B ниже. "
+                        + "1 — accent1-100, 2 — accent1-200, 3 — accent1-500 (насыщенный акцент системы). "
+                        + "4 — neutral1-100, 5 — neutral1-500 (нейтральные серые системы). "
+                        + "6 — accent3-100 (третий акцент). Это те же цвета, что Google подобрал под твои обои.");
+        DESC.put("Прозрачность цвета (0-255)",
+                "Плотность подложки, когда «Матовое стекло» выключено: 0 — невидима, 60–120 — прозрачная, 255 — сплошная.");
+        DESC.put("Красный (R, если 0)",
+                "Красный канал ручного цвета. Используется только при «Цвет как в системе» = 0.");
+        DESC.put("Зелёный (G, если 0)",
+                "Зелёный канал ручного цвета.");
+        DESC.put("Синий (B, если 0)",
+                "Синий канал ручного цвета.");
+
+        DESC.put("Матовое стекло (как системная прозрачность)",
+                "Размытые обои под подложкой — визуально как прозрачность в системе Google.");
+        DESC.put("Размытие обоев под подложкой",
+                "Вкл — под подложкой видно размытые обои. Работает в обоих режимах.");
+        DESC.put("Сила размытия (px)",
+                "Больше значение — мягче и сильнее размытие. 16–40 — как в системе.");
+        DESC.put("Непрозрачность стекла (0-255)",
+                "Плотность цвета поверх размытых обоев (в режиме стекла вместо «Прозрачность цвета»): "
+                        + "0 — чистое стекло, 120–180 — как системная плашка, 255 — сплошной цвет.");
+        DESC.put("Насыщенность стекла (%)",
+                "100% — как на обоях. 130–160% — цвета сочнее (как в iOS и Android), 0% — чёрно-белое.");
+        DESC.put("Смещение обоев по X (px)",
+                "Подгонка, если размытый фрагмент обоев не совпадает с фоном под доком.");
+        DESC.put("Смещение обоев по Y (px)",
+                "То же самое по вертикали.");
+    }
+
     private LinearLayout createCard(LinearLayout parent, String title) {
         com.google.android.material.card.MaterialCardView card = new com.google.android.material.card.MaterialCardView(this);
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
@@ -453,6 +586,16 @@ public class MainActivity extends AppCompatActivity {
         tv.setTextSize(16f);
         tv.setTypeface(null, android.graphics.Typeface.BOLD);
         content.addView(tv);
+
+        String desc = DESC.get(title);
+        if (desc != null) {
+            TextView sub = new TextView(this);
+            sub.setText(desc);
+            sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+            sub.setAlpha(0.65f);
+            sub.setPadding(0, 4, 0, 8);
+            content.addView(sub);
+        }
 
         card.addView(content);
         parent.addView(card);
