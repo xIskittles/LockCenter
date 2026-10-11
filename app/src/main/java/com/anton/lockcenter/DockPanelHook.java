@@ -165,7 +165,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             log("класс Hotseat не найден в " + pkg + " — док-панель отключена");
             return;
         }
-        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName());
+        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v4)");
 
         XposedBridge.hookAllConstructors(hotseatClass, new XC_MethodHook() {
             @Override
@@ -735,6 +735,9 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         float pendingAlpha = 1f;
         long lastSearchScan = 0L;
         long lastConfigCheck = 0L;
+        WeakReference<View> appsRef = new WeakReference<>(null);
+        long lastAppsScan = 0L;
+        boolean drawerHiddenLogged = false;
 
         PanelState(ViewGroup container) {
             this.container = container;
@@ -981,9 +984,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             if (mode == MODE_LAYER) {
                 // «свой слой»: база — ряд иконок дока (+ строка поиска, если включена)
                 View search = findSearchView();
-                if (!unionChildren(hs, search, base)) {
-                    if (!visualBounds(hs, base)) return false;
-                }
+                if (!unionChildren(hs, search, base)) return false;   // иконок нет — не рисуем
                 if (includeSearch && search != null) {
                     RectF sBox = new RectF();
                     if (search.getVisibility() == View.VISIBLE
@@ -1001,6 +1002,8 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 // стандартный режим с расширением: база — сам док (строка поиска внутри него)
                 View search = findSearchView();
                 if (!visualBounds(hs, base)) return false;
+                RectF icons = new RectF();
+                if (!unionChildren(hs, search, icons)) return false;   // иконок нет — не рисуем
                 if (!includeSearch && search != null && search.getHeight() > 0) {
                     topExtra = Math.round(search.getTop() + search.getTranslationY()) + search.getHeight();
                 }
@@ -1010,6 +1013,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
 
             if (base.width() <= 1f || base.height() <= 1f) return false;
             if (base.centerY() < H * 0.55f) return false;   // док должен быть в нижней части экрана
+            if (coveredByDrawer(base, H)) return false;     // открыто меню приложений
 
             // Плюс = внутрь (подложка меньше), минус = наружу (расширение).
             float top = base.top + topExtra + topPadPx + Math.max(0, offsetYPx);
@@ -1073,7 +1077,11 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             return clampF(a, 0f, 1f);
         }
 
-        /** Иконки иногда гасят по отдельности (setIconsAlpha) — учитываем и это. */
+        /**
+         * Иконки иногда гасят по отдельности (setIconsAlpha), а в меню приложений
+         * их вообще прячут (GONE) — тогда сама View дока остаётся «видимой».
+         * Поэтому смотрим именно на иконки: если живых иконок нет — подложку не рисуем.
+         */
         private float iconsAlpha(View hotseat) {
             if (!(hotseat instanceof ViewGroup)) return 1f;
             ViewGroup g = (ViewGroup) hotseat;
@@ -1083,19 +1091,28 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 View ch = g.getChildAt(i);
                 if (ch.getVisibility() != View.VISIBLE) continue;
                 if (search != null && isSameOrDescendant(ch, search)) continue;
-                float a = alphaFrom(ch, hotseat);
+
+                float a = -1f;
                 if (ch instanceof ViewGroup) {
                     ViewGroup cg = (ViewGroup) ch;
+                    boolean hasLeaf = false;
                     for (int j = 0; j < cg.getChildCount(); j++) {
                         View leaf = cg.getChildAt(j);
                         if (leaf.getVisibility() != View.VISIBLE) continue;
-                        a = Math.max(a, alphaFrom(leaf, hotseat));
+                        if (search != null && isSameOrDescendant(leaf, search)) continue;
+                        if (leaf.getWidth() <= 0 && leaf.getHeight() <= 0) continue;
+                        float la = alphaFrom(leaf, hotseat);
+                        a = hasLeaf ? Math.max(a, la) : la;
+                        hasLeaf = true;
                     }
+                    if (!hasLeaf) continue;   // контейнер есть, а иконок в нём нет
+                } else {
+                    a = alphaFrom(ch, hotseat);
                 }
-                best = Math.max(best, a);
+                if (a >= 0f) best = Math.max(best, a);
             }
-            // если в доке не осталось ни одной видимой иконки (меню приложений и т.п.) —
-            // подложку не рисуем, иначе она просвечивает сквозь блюр
+            // ни одной видимой иконки (меню приложений и т.п.) — подложку не рисуем,
+            // иначе она просвечивает сквозь блюр
             return best < 0f ? 0f : clampF(best, 0f, 1f);
         }
 
@@ -1174,6 +1191,61 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                     collectSearchCandidates(g.getChildAt(i), out, depth + 1, counter);
                 }
             }
+        }
+
+        // ---------------------------------------------------------- меню приложений
+
+        /** Кэш View меню приложений: пока оно открыто, подложка не рисуется. */
+        private View appsView() {
+            View cached = appsRef.get();
+            if (cached != null && cached.isAttachedToWindow()) return cached;
+            long now = System.currentTimeMillis();
+            if (now - lastAppsScan < 2000L) return null;
+            lastAppsScan = now;
+            View found = null;
+            for (int i = 0; i < container.getChildCount(); i++) {
+                View c = container.getChildAt(i);
+                if (isAppsView(c)) {
+                    found = c;
+                    break;
+                }
+            }
+            appsRef = new WeakReference<>(found);
+            return found;
+        }
+
+        private static boolean isAppsView(View v) {
+            String cn = v.getClass().getName().toLowerCase(Locale.US);
+            if (cn.contains("allapps")) return true;
+            int id = v.getId();
+            if (id != View.NO_ID) {
+                try {
+                    String en = v.getResources().getResourceEntryName(id).toLowerCase(Locale.US);
+                    if (en.contains("apps_view") || en.contains("all_apps")) return true;
+                } catch (Throwable ignored) {
+                }
+            }
+            return false;
+        }
+
+        /** Открытое меню приложений накрывает док — подложку не рисуем вообще. */
+        private boolean coveredByDrawer(RectF dockBox, int screenH) {
+            View apps = appsView();
+            boolean hidden;
+            if (apps == null || !apps.isShown() || apps.getAlpha() < 0.05f) {
+                hidden = false;
+            } else {
+                RectF box = new RectF();
+                hidden = visualBounds(apps, box)
+                        && box.height() > screenH * 0.5f
+                        && box.top < dockBox.centerY();
+            }
+            if (hidden != drawerHiddenLogged) {
+                drawerHiddenLogged = hidden;
+                log(hidden ? "меню приложений накрыло док — подложка скрыта"
+                        : "меню приложений закрыто — подложка снова рисуется");
+            }
+            return hidden;
         }
     }
 
