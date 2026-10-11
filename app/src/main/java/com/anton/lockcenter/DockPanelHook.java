@@ -165,7 +165,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             log("класс Hotseat не найден в " + pkg + " — док-панель отключена");
             return;
         }
-        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v6)");
+        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v7)");
 
         XposedBridge.hookAllConstructors(hotseatClass, new XC_MethodHook() {
             @Override
@@ -628,13 +628,13 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             ORIGINAL_BG.put(hotseat, hotseat.getBackground());
         }
 
-        // Если нужны отрицательные отступы (расширение), фон Hotseat не подходит:
-        // система обрезает всё, что выходит за границы View. Тогда подложку рисует
-        // DragLayer — см. overhangRequested()/overlayMode(), геометрия остаётся той же.
+        // Отрицательные отступы (расширение наружу) в этом режиме не работают:
+        // фон View система обрезает по её границам, и во время системных анимаций
+        // (когда View получает alpha-слой) «вылезшая» часть пропадает — это и была
+        // та самая обрезка сверху. Поэтому здесь только внутрь, а расширение наружу
+        // доступно в «Альтернативном режиме».
         if (overhangRequested()) {
-            restoreHotseatBackground(hotseat);
-            logOnce("расширение за границы дока: подложка рисуется слоем DragLayer");
-            return;
+            logOnce("отрицательные отступы игнорируются в режиме «фон дока» — включи «Альтернативный режим»");
         }
 
         int topPad = Math.max(0, topPadPx);
@@ -721,10 +721,6 @@ public class DockPanelHook implements IXposedHookLoadPackage {
 
         final RectF rect = new RectF();
         final RectF lastDrawn = new RectF();
-        final RectF targetRect = new RectF();
-        final RectF shownRect = new RectF();
-        float shownAlpha = 0f;
-        long lastSmoothTime = 0L;
 
         boolean registered = false;
         boolean visible = false;
@@ -739,8 +735,6 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         float pendingAlpha = 1f;
         long lastSearchScan = 0L;
         long lastConfigCheck = 0L;
-        WeakReference<View> appsRef = new WeakReference<>(null);
-        long lastAppsScan = 0L;
         boolean drawerHiddenLogged = false;
 
         PanelState(ViewGroup container) {
@@ -787,9 +781,15 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             }
         }
 
-        /** true — подложка рисуется в DragLayer (свободная геометрия и расширение). */
+        /**
+         * true — подложка рисуется отдельным слоем в DragLayer (свободная геометрия,
+         * расширение за границы дока). В обычном режиме подложка — это фон самого
+         * дока, поэтому она идеально повторяет все системные анимации; в слой
+         * автоматически больше не переключаемся: отрицательные отступы в обычном
+         * режиме просто игнорируются, а не ломают привязку к доку.
+         */
         private boolean overlayMode() {
-            return mode == MODE_LAYER || overhangRequested();
+            return mode == MODE_LAYER;
         }
 
         // ---------------------------------------------------------- кадр
@@ -844,39 +844,13 @@ public class DockPanelHook implements IXposedHookLoadPackage {
 
         /**
          * Пересчитывает геометрию и, если она изменилась, просит перерисовку.
-         * Всё сглаживается по времени (~110 мс), поэтому резкие события — иконки
-         * в доке спрятались, меню приложений накрыло док — не рубят панель,
-         * а плавно её гасят.
+         * Никакого сглаживания: и геометрия, и прозрачность берутся прямо из дока
+         * (его alpha, масштаб и положение в окне), поэтому подложка движется
+         * ровно вместе с доком, кадр в кадр.
          */
         private boolean updateGeometry() {
-            long now = System.currentTimeMillis();
-            float dt = (lastSmoothTime == 0L) ? 16f : clampF(now - lastSmoothTime, 4f, 200f);
-            lastSmoothTime = now;
-            float k = clampF(dt / 110f, 0.04f, 1f);
-
-            boolean targetVisible = computeRect(targetRect);
-            float targetAlpha = targetVisible ? pendingAlpha : 0f;
-
-            if (targetVisible) {
-                if (shownRect.width() <= 1f) {
-                    // первый раз — без анимации
-                    shownRect.set(targetRect);
-                    shownAlpha = targetAlpha;
-                } else {
-                    lerpRect(shownRect, targetRect, k);
-                    shownAlpha += (targetAlpha - shownAlpha) * k;
-                }
-            } else {
-                // цели нет — плавно гасим то, что было нарисовано
-                shownAlpha += (0f - shownAlpha) * k;
-            }
-            rect.set(shownRect);
-
-            boolean visibleNow = shownAlpha > 0.02f && rect.width() > 1f && rect.height() > 1f;
-            pendingAlpha = clampF(shownAlpha, 0f, 1f);
-            visible = visibleNow;
-
-            int sig = visibleNow ? signature() : 0;
+            visible = computeRect(rect);
+            int sig = visible ? signature() : 0;
             if (!haveSignature || sig != lastSignature) {
                 haveSignature = true;
                 lastSignature = sig;
@@ -884,13 +858,6 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 return true;
             }
             return false;
-        }
-
-        private static void lerpRect(RectF cur, RectF target, float k) {
-            cur.left += (target.left - cur.left) * k;
-            cur.top += (target.top - cur.top) * k;
-            cur.right += (target.right - cur.right) * k;
-            cur.bottom += (target.bottom - cur.bottom) * k;
         }
 
         /**
@@ -1023,7 +990,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             if (mode == MODE_LAYER) {
                 // «свой слой»: база — ряд иконок дока (+ строка поиска, если включена)
                 View search = findSearchView();
-                if (!unionChildren(hs, search, base)) return false;   // иконок нет — не рисуем
+                if (!unionChildren(hs, search, base) && !visualBounds(hs, base)) return false;
                 if (includeSearch && search != null) {
                     RectF sBox = new RectF();
                     if (search.getVisibility() == View.VISIBLE
@@ -1041,8 +1008,6 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 // стандартный режим с расширением: база — сам док (строка поиска внутри него)
                 View search = findSearchView();
                 if (!visualBounds(hs, base)) return false;
-                RectF icons = new RectF();
-                if (!unionChildren(hs, search, icons)) return false;   // иконок нет — не рисуем
                 if (!includeSearch && search != null && search.getHeight() > 0) {
                     topExtra = Math.round(search.getTop() + search.getTranslationY()) + search.getHeight();
                 }
@@ -1053,10 +1018,10 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             if (base.width() <= 1f || base.height() <= 1f) return false;
             if (base.centerY() < H * 0.55f) return false;   // док должен быть в нижней части экрана
 
-            // Прогресс открытия меню приложений: подложка гаснет вместе с фоном,
-            // а не пропадает рывком. Жёсткое скрытие — только как страховка.
+            // Прогресс открытия меню приложений: подложка гаснет вместе с фоном
+            // (по системному размытию и уменьшению дока), без рывков и без
+            // жёсткого скрытия — только плавная прозрачность.
             float openP = drawerProgress(hs, a);
-            if (openP > 0.05f && coveredByDrawer(base, H)) return false;
 
             // Плюс = внутрь (подложка меньше), минус = наружу (расширение).
             float top = base.top + topExtra + topPadPx + Math.max(0, offsetYPx);
@@ -1272,49 +1237,6 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         }
 
         // ---------------------------------------------------------- меню приложений
-
-        /** Кэш View меню приложений: пока оно открыто, подложка не рисуется. */
-        private View appsView() {
-            View cached = appsRef.get();
-            if (cached != null && cached.isAttachedToWindow()) return cached;
-            long now = System.currentTimeMillis();
-            if (now - lastAppsScan < 2000L) return null;
-            lastAppsScan = now;
-            View found = null;
-            for (int i = 0; i < container.getChildCount(); i++) {
-                View c = container.getChildAt(i);
-                if (isAppsView(c)) {
-                    found = c;
-                    break;
-                }
-            }
-            appsRef = new WeakReference<>(found);
-            return found;
-        }
-
-        private static boolean isAppsView(View v) {
-            String cn = v.getClass().getName().toLowerCase(Locale.US);
-            if (cn.contains("allapps")) return true;
-            int id = v.getId();
-            if (id != View.NO_ID) {
-                try {
-                    String en = v.getResources().getResourceEntryName(id).toLowerCase(Locale.US);
-                    if (en.contains("apps_view") || en.contains("all_apps")) return true;
-                } catch (Throwable ignored) {
-                }
-            }
-            return false;
-        }
-
-        /** Открытое меню приложений накрывает док — подложку не рисуем вообще. */
-        private boolean coveredByDrawer(RectF dockBox, int screenH) {
-            View apps = appsView();
-            if (apps == null || !apps.isShown() || apps.getAlpha() < 0.05f) return false;
-            RectF box = new RectF();
-            return visualBounds(apps, box)
-                    && box.height() > screenH * 0.5f
-                    && box.top < dockBox.centerY();
-        }
     }
 
     /** Фон Hotseat: рисует ту же подложку, но в своих границах. */
