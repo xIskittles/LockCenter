@@ -66,6 +66,8 @@ public class MainActivity extends AppCompatActivity {
     private int dockFrostSaturation;
     private int dockFrostOffsetX;
     private int dockFrostOffsetY;
+    private int dockDarkenPct;
+    private int dockPageDotOffsetPx;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -107,6 +109,8 @@ public class MainActivity extends AppCompatActivity {
         dockFrostSaturation = prefs.getInt("dock_frost_saturation", 145);
         dockFrostOffsetX = prefs.getInt("dock_frost_offset_x", 0);
         dockFrostOffsetY = prefs.getInt("dock_frost_offset_y", 0);
+        dockDarkenPct = prefs.getInt("dock_darken", 0);
+        dockPageDotOffsetPx = prefs.getInt("dock_page_dots_offset_px", 0);
 
         LinearLayout list = findViewById(R.id.settings_list);
 
@@ -131,6 +135,7 @@ public class MainActivity extends AppCompatActivity {
         addIntRow(list, "Отступ сверху (px, минус = выше)", -600, 600, dockTopPadPx, v -> dockTopPadPx = v);
         addIntRow(list, "Отступ снизу (px, минус = ниже)", -600, 600, dockBottomPadPx, v -> dockBottomPadPx = v);
         addIntRow(list, "Сдвиг по вертикали (px)", -250, 250, dockOffsetYPx, v -> dockOffsetYPx = v);
+        addIntRow(list, "Сдвиг точек страниц (px, минус = выше)", -300, 300, dockPageDotOffsetPx, v -> dockPageDotOffsetPx = v);
 
         addSectionHeader(list, "Обводка подложки");
         addIntRow(list, "Толщина обводки (px, 0 = выкл)", 0, 16, dockStrokeWidthPx, v -> dockStrokeWidthPx = v);
@@ -143,6 +148,7 @@ public class MainActivity extends AppCompatActivity {
         addIntRow(list, "Красный (R, если 0)", 0, 255, dockColorR, v -> dockColorR = v);
         addIntRow(list, "Зелёный (G, если 0)", 0, 255, dockColorG, v -> dockColorG = v);
         addIntRow(list, "Синий (B, если 0)", 0, 255, dockColorB, v -> dockColorB = v);
+        addIntRow(list, "Затемнение подложки (0-100)", 0, 100, dockDarkenPct, v -> dockDarkenPct = v);
 
         addSectionHeader(list, "Матовое стекло (как системная прозрачность)");
         addSwitchRow(list, "Размытие обоев под подложкой", dockFrosted, v -> dockFrosted = v);
@@ -305,6 +311,8 @@ public class MainActivity extends AppCompatActivity {
                 .putInt("dock_frost_saturation", dockFrostSaturation)
                 .putInt("dock_frost_offset_x", dockFrostOffsetX)
                 .putInt("dock_frost_offset_y", dockFrostOffsetY)
+                .putInt("dock_darken", dockDarkenPct)
+                .putInt("dock_page_dots_offset_px", dockPageDotOffsetPx)
                 .apply();
 
         // Безопасный формат через запятые без спецсимволов консоли
@@ -339,7 +347,9 @@ public class MainActivity extends AppCompatActivity {
                 + ",dock_frost_alpha=" + dockFrostAlpha
                 + ",dock_frost_saturation=" + dockFrostSaturation
                 + ",dock_frost_offset_x=" + dockFrostOffsetX
-                + ",dock_frost_offset_y=" + dockFrostOffsetY;
+                + ",dock_frost_offset_y=" + dockFrostOffsetY
+                + ",dock_darken=" + dockDarkenPct
+                + ",dock_page_dots_offset_px=" + dockPageDotOffsetPx;
 
         String fileContent = "clock_scale_x=" + clockScaleX + "\n"
                 + "clock_scale_y=" + clockScaleY + "\n"
@@ -372,7 +382,9 @@ public class MainActivity extends AppCompatActivity {
                 + "dock_frost_alpha=" + dockFrostAlpha + "\n"
                 + "dock_frost_saturation=" + dockFrostSaturation + "\n"
                 + "dock_frost_offset_x=" + dockFrostOffsetX + "\n"
-                + "dock_frost_offset_y=" + dockFrostOffsetY + "\n";
+                + "dock_frost_offset_y=" + dockFrostOffsetY + "\n"
+                + "dock_darken=" + dockDarkenPct + "\n"
+                + "dock_page_dots_offset_px=" + dockPageDotOffsetPx + "\n";
 
         String extra = SYSTEMUI_PKG + " " + LAUNCHER_PKG;
 
@@ -597,6 +609,8 @@ public class MainActivity extends AppCompatActivity {
                 "Плюс — нижний край выше (подложка меньше). Минус (ниже дока, растянуть вниз) работает только в «Альтернативном режиме».");
         DESC.put("Сдвиг по вертикали (px)",
                 "Сдвигает всю подложку вверх (минус) или вниз (плюс), не меняя её высоту.");
+        DESC.put("Сдвиг точек страниц (px, минус = выше)",
+                "Двигает точки-индикаторы рабочих столов вверх (минус) или вниз (плюс). Пригодится, когда док вырос и точки оказались слишком близко к нему.");
 
         DESC.put("Обводка подложки",
                 "Тонкий контур по краю подложки — так выглядят поверхности в Material 3.");
@@ -616,6 +630,8 @@ public class MainActivity extends AppCompatActivity {
                         + "6 — accent3-100 (третий акцент). Это те же цвета, что Google подобрал под твои обои.");
         DESC.put("Прозрачность цвета (0-255)",
                 "Плотность подложки, когда «Матовое стекло» выключено: 0 — невидима, 60–120 — прозрачная, 255 — сплошная.");
+        DESC.put("Затемнение подложки (0-100)",
+                "0 — цвет как есть. 20–40 — чуть темнее (лучше видно иконки на светлых обоях), «Матовое стекло» тоже темнеет. 100 — почти чёрная.");
         DESC.put("Красный (R, если 0)",
                 "Красный канал ручного цвета. Используется только при «Цвет как в системе» = 0.");
         DESC.put("Зелёный (G, если 0)",

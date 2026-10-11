@@ -105,6 +105,8 @@ public class DockPanelHook implements IXposedHookLoadPackage {
     static volatile int frostSaturation = 145;
     static volatile int frostOffsetX = 0;
     static volatile int frostOffsetY = 0;
+    static volatile int darkenPct = 0;          // затемнение подложки, 0..100
+    static volatile int pageDotOffsetPx = 0;    // сдвиг точек страниц, минус = выше
 
     /** Нужно пересобрать размытые обои. */
     static volatile boolean frostDirty = true;
@@ -165,7 +167,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             log("класс Hotseat не найден в " + pkg + " — док-панель отключена");
             return;
         }
-        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v10)");
+        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v11)");
 
         XposedBridge.hookAllConstructors(hotseatClass, new XC_MethodHook() {
             @Override
@@ -386,10 +388,21 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         }
     }
 
+    /** Насколько затемнить цвет подложки (1.0 — не менять, 0.15 — почти чёрный). */
+    private static float darkenFactor() {
+        return 1f - clamp(darkenPct, 0, 100) / 100f * 0.85f;
+    }
+
     private static int baseColor(Context ctx) {
         int c = systemColor(ctx, colorMode);
-        if (c != 0) return c;
-        return Color.rgb(clamp(colorR, 0, 255), clamp(colorG, 0, 255), clamp(colorB, 0, 255));
+        if (c == 0) {
+            c = Color.rgb(clamp(colorR, 0, 255), clamp(colorG, 0, 255), clamp(colorB, 0, 255));
+        }
+        float f = darkenFactor();
+        if (f >= 0.999f) return c;
+        return Color.rgb(clamp(Math.round(Color.red(c) * f), 0, 255),
+                clamp(Math.round(Color.green(c) * f), 0, 255),
+                clamp(Math.round(Color.blue(c) * f), 0, 255));
     }
 
     private static int lighten(int channel) {
@@ -482,13 +495,22 @@ public class DockPanelHook implements IXposedHookLoadPackage {
     /** Насыщенность размытого сэмпла обоев (как «vibrancy» в iOS). */
     private static ColorFilter saturationFilter() {
         int sat = clamp(frostSaturation, 0, 200);
-        if (sat == 100) return null;
-        if (saturationFilter != null && saturationFilterKey == sat) return saturationFilter;
+        int dark = clamp(darkenPct, 0, 100);
+        if (sat == 100 && dark == 0) return null;
+        if (saturationFilter != null && saturationFilterKey == sat * 1000 + dark) return saturationFilter;
         try {
             ColorMatrix cm = new ColorMatrix();
             cm.setSaturation(sat / 100f);
+            if (dark > 0) {
+                float f = 1f - dark / 100f * 0.85f;
+                cm.postConcat(new ColorMatrix(new float[]{
+                        f, 0, 0, 0, 0,
+                        0, f, 0, 0, 0,
+                        0, 0, f, 0, 0,
+                        0, 0, 0, 1, 0}));
+            }
             saturationFilter = new ColorMatrixColorFilter(cm);
-            saturationFilterKey = sat;
+            saturationFilterKey = sat * 1000 + dark;
         } catch (Throwable t) {
             saturationFilter = null;
             saturationFilterKey = -1;
@@ -785,6 +807,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         h = 31 * h + (frosted ? 1 : 0) + 3 * frostAlpha + 5 * frostRadius
                 + 7 * frostOffsetX + 11 * frostOffsetY + 53 * frostSaturation;
         h = 31 * h + (includeSearch ? 1 : 0) + (keepOriginalBg ? 2 : 0);
+        h = 31 * h + 7 * darkenPct + 11 * pageDotOffsetPx;
         h = 31 * h + hotseat.getWidth() + 3 * hotseat.getHeight() + 5 * hotseat.getPaddingTop();
         if (!includeSearch) {
             // метрики строки поиска важны только когда подложка начинается под ней;
@@ -804,6 +827,9 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         final ViewGroup container;
         WeakReference<View> hotseatRef = new WeakReference<>(null);
         WeakReference<View> searchRef = new WeakReference<>(null);
+        WeakReference<View> dotsRef = new WeakReference<>(null);
+        long lastDotsScan = 0L;
+        float dotsOriginal = Float.NaN;
 
         final RectF rect = new RectF();
         final RectF lastDrawn = new RectF();
@@ -913,6 +939,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                     // чтобы минусовые отступы не обрезались)
                     View hs = hotseatRef.get();
                     if (hs != null) updateHotseatBackground(hs);
+                    applyDotsOffset();
                     visible = false;
                     lastDrawnValid = false;
                     if (modeChanged) container.invalidate();
@@ -962,6 +989,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                     if (!overlayMode()) {
                         View hs = hotseatRef.get();
                         if (hs != null) updateHotseatBackground(hs);
+                        applyDotsOffset();
                     } else if (updateGeometry()) {
                         fastUntil = System.currentTimeMillis() + 800L;
                     }
@@ -1063,6 +1091,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             h = 31 * h + (frosted ? 1 : 0) + 3 * frostAlpha + 5 * frostRadius
                     + 7 * frostOffsetX + 11 * frostOffsetY + 53 * frostSaturation;
             h = 31 * h + (overlayMode() ? 1 : 0);
+            h = 31 * h + 7 * darkenPct + 11 * pageDotOffsetPx;
             return h;
         }
 
@@ -1199,8 +1228,67 @@ public class DockPanelHook implements IXposedHookLoadPackage {
         }
 
         /** Объединение видимых детей (иконки дока). Строка поиска исключается. */
-        private boolean unionChildren(View v, View exclude, RectF out) {
-            if (!(v instanceof ViewGroup)) return false;
+        /** Точки страниц рабочего стола (индикатор количества экранов). */
+        private View dotsView() {
+            View cached = dotsRef.get();
+            if (cached != null && cached.isAttachedToWindow()) return cached;
+            long now = System.currentTimeMillis();
+            if (now - lastDotsScan < 2000L) return null;
+            lastDotsScan = now;
+            View found = findDots(container);
+            dotsRef = new WeakReference<>(found);
+            if (found != null) log("точки страниц найдены: " + describe(found));
+            return found;
+        }
+
+        private static View findDots(View v) {
+            if (!(v instanceof ViewGroup)) return null;
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View c = g.getChildAt(i);
+                String cn = c.getClass().getName().toLowerCase(Locale.US);
+                boolean hit = cn.contains("pageindicator");
+                if (!hit) {
+                    int id = c.getId();
+                    if (id != View.NO_ID) {
+                        try {
+                            String en = c.getResources().getResourceEntryName(id).toLowerCase(Locale.US);
+                            hit = en.contains("page_indicator");
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+                if (hit) return c;
+                View deep = findDots(c);
+                if (deep != null) return deep;
+            }
+            return null;
+        }
+
+        /**
+         * Сдвигает точки страниц на заданный отступ. Трогаем их только когда
+         * лаунчер их не анимирует (translation равен исходному) — чтобы не мешать
+         * системным переходам.
+         */
+        private void applyDotsOffset() {
+            try {
+                View dots = dotsView();
+                if (dots == null) return;
+                if (Float.isNaN(dotsOriginal)) dotsOriginal = dots.getTranslationY();
+                float cur = dots.getTranslationY();
+                if (pageDotOffsetPx == 0) {
+                    if (cur != dotsOriginal) dots.setTranslationY(dotsOriginal);
+                    return;
+                }
+                if (cur == dotsOriginal) {
+                    dots.setTranslationY(dotsOriginal + pageDotOffsetPx);
+                }
+            } catch (Throwable t) {
+                logOnce("applyDotsOffset: " + t);
+            }
+        }
+
+        private boolean unionChildren(View v, View exclude, RectF out) {            if (!(v instanceof ViewGroup)) return false;
             ViewGroup g = (ViewGroup) v;
             boolean found = false;
             for (int i = 0; i < g.getChildCount(); i++) {
@@ -1632,6 +1720,8 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             else if ("dock_frost_saturation".equals(k)) frostSaturation = clamp(intOf(v, frostSaturation), 0, 200);
             else if ("dock_frost_offset_x".equals(k)) frostOffsetX = clamp(intOf(v, frostOffsetX), -1000, 1000);
             else if ("dock_frost_offset_y".equals(k)) frostOffsetY = clamp(intOf(v, frostOffsetY), -1000, 1000);
+            else if ("dock_darken".equals(k)) darkenPct = clamp(intOf(v, darkenPct), 0, 100);
+            else if ("dock_page_dots_offset_px".equals(k)) pageDotOffsetPx = clamp(intOf(v, pageDotOffsetPx), -300, 300);
         } catch (Throwable ignored) {
         }
     }
@@ -1705,7 +1795,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 + " margin=" + sideMarginPx + " pads=" + topPadPx + "/" + bottomPadPx
                 + " alpha=" + alpha + " color=" + describeColorMode()
                 + " frost=" + frosted + "/" + frostRadius + "/" + frostAlpha + "/" + frostSaturation
-                + " search=" + includeSearch);
+                + " search=" + includeSearch + " darken=" + darkenPct + " dots=" + pageDotOffsetPx);
     }
 
     private static void log(String msg) {
