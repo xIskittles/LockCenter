@@ -209,11 +209,39 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
         }
 
         for (int i = 0; i < classes.size(); i++) {
-            forceTrue(cl, classes.get(i), hooked);
+            String cn = classes.get(i);
+            forceTrue(cl, cn, hooked);
+            // у классов-обёрток флагов печатаем имена методов — по ним видно,
+            // какие флаги реально есть в сборке
+            String simple = cn.substring(cn.lastIndexOf('.') + 1);
+            if ("Flags".equals(simple) || simple.startsWith("FeatureFlags")) {
+                listShadeMethods(cl, cn);
+            }
         }
         log("итого включено методов: " + hooked.size());
     }
 
+    /** Печатает методы класса флагов, относящиеся к шторке. */
+    private static void listShadeMethods(ClassLoader cl, String className) {
+        try {
+            Class<?> cls = Class.forName(className, false, cl);
+            Method[] ms = cls.getDeclaredMethods();
+            int shown = 0;
+            for (int i = 0; i < ms.length; i++) {
+                Method m = ms[i];
+                String n = m.getName().toLowerCase(Locale.US);
+                if (n.contains("shade") || n.contains("scene") || n.contains("split") || n.contains("dual")) {
+                    if (shown++ < 60) {
+                        log("  метод: " + className + "#" + m.getName()
+                                + " -> " + m.getReturnType().getSimpleName());
+                    }
+                }
+            }
+            log("  всего методов в " + className + ": " + ms.length + ", из них по шторке: " + shown);
+        } catch (Throwable t) {
+            log("  методы " + className + " не прочитать: " + t);
+        }
+    }
     /** Ищем в байтах dex строки-дескрипторы классов SystemUI с нужными словами. */
     private static void scanDex(byte[] data, List<String> out) {
         final byte[] marker = "Lcom/android/systemui/".getBytes();
@@ -251,7 +279,7 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
                 i++;
                 continue;
             }
-            String cls = new String(data, i + 1, end - i - 1);
+            String cls = new String(data, i + 1, end - i - 1).replace('/', '.');
             String lower = cls.toLowerCase(Locale.US);
             if (lower.contains("flag") || lower.contains("dualshade") || lower.contains("scenecontainer")
                     || lower.contains("splitshade") || lower.contains("shademode")

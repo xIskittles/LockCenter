@@ -165,7 +165,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             log("класс Hotseat не найден в " + pkg + " — док-панель отключена");
             return;
         }
-        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v7)");
+        log("модуль активен в " + pkg + ", Hotseat = " + hotseatClass.getName() + " (dock v8)");
 
         XposedBridge.hookAllConstructors(hotseatClass, new XC_MethodHook() {
             @Override
@@ -628,22 +628,16 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             ORIGINAL_BG.put(hotseat, hotseat.getBackground());
         }
 
-        // Отрицательные отступы (расширение наружу) в этом режиме не работают:
-        // фон View система обрезает по её границам, и во время системных анимаций
-        // (когда View получает alpha-слой) «вылезшая» часть пропадает — это и была
-        // та самая обрезка сверху. Поэтому здесь только внутрь, а расширение наружу
-        // доступно в «Альтернативном режиме».
-        if (overhangRequested()) {
-            logOnce("отрицательные отступы игнорируются в режиме «фон дока» — включи «Альтернативный режим»");
-        }
-
-        int topPad = Math.max(0, topPadPx);
-        int bottomPad = Math.max(0, bottomPadPx);
+        // Отрицательные отступы разрешены и в этом режиме: фон дока рисуется поверх
+        // границ вью. Тонкость одна — «вылезшая» полоса не попадает в область
+        // перерисовки дока, поэтому её нужно перерисовывать явно (invalidateOverflow).
+        int topPad = topPadPx;
+        int bottomPad = bottomPadPx;
 
         int topInset = topPad + Math.max(0, offsetYPx);
         int bottomInset = bottomPad + Math.max(0, -offsetYPx);
 
-        if (!includeSearch) {
+        if (!includeSearch && topPad >= 0) {
             // подложка должна начинаться под строкой поиска (она — ребёнок Hotseat)
             View qsb = readSearchView(hotseat);
             if (qsb != null && qsb.getHeight() > 0) {
@@ -652,7 +646,7 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             }
         }
 
-        int sideInset = Math.max(0, sideMarginPx);
+        int sideInset = sideMarginPx;
         lastBgApplyTime = now;
 
         // Свой Drawable вместо InsetDrawable: InsetDrawable отдаёт свои отступы как
@@ -824,9 +818,12 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                 }
 
                 if (!overlay) {
-                    // подложка живёт фоном Hotseat (не выходит за его границы)
+                    // подложка живёт фоном Hotseat
                     View hs = hotseatRef.get();
-                    if (hs != null) updateHotseatBackground(hs);
+                    if (hs != null) {
+                        updateHotseatBackground(hs);
+                        invalidateOverflow(hs);
+                    }
                     visible = false;
                     lastDrawnValid = false;
                     if (modeChanged) container.invalidate();
@@ -873,7 +870,10 @@ public class DockPanelHook implements IXposedHookLoadPackage {
                     if (!registered) return;
                     if (!overlayMode()) {
                         View hs = hotseatRef.get();
-                        if (hs != null) updateHotseatBackground(hs);
+                        if (hs != null) {
+                            updateHotseatBackground(hs);
+                            invalidateOverflow(hs);
+                        }
                     } else if (updateGeometry()) {
                         fastUntil = System.currentTimeMillis() + 800L;
                     }
@@ -925,6 +925,39 @@ public class DockPanelHook implements IXposedHookLoadPackage {
             try {
                 container.invalidate((int) Math.floor(damage.left), (int) Math.floor(damage.top),
                         (int) Math.ceil(damage.right), (int) Math.ceil(damage.bottom));
+            } catch (Throwable ignored) {
+            }
+        }
+
+        /**
+         * В режиме «фон дока» подложка может вылезать за границы дока (минусовые
+         * отступы). Такая полоса не входит в область перерисовки самого дока,
+         * поэтому просим перерисовать её у контейнера — иначе она «застывает» и
+         * выглядит как обрезка сверху.
+         */
+        private void invalidateOverflow(View hs) {
+            if (hs == null) return;
+            if (topPadPx >= 0 && bottomPadPx >= 0 && sideMarginPx >= 0 && offsetYPx == 0) return;
+            try {
+                RectF box = new RectF();
+                if (!visualBounds(hs, box)) return;
+                int side = Math.min(0, sideMarginPx);
+                int top = Math.min(0, topPadPx) + Math.min(0, offsetYPx);
+                int bottom = Math.min(0, bottomPadPx) + Math.min(0, -offsetYPx);
+                if (top != 0) {
+                    container.invalidate((int) Math.floor(box.left + side), (int) Math.floor(box.top + top),
+                            (int) Math.ceil(box.right - side), (int) Math.ceil(box.top));
+                }
+                if (bottom != 0) {
+                    container.invalidate((int) Math.floor(box.left + side), (int) Math.floor(box.bottom),
+                            (int) Math.ceil(box.right - side), (int) Math.ceil(box.bottom - bottom));
+                }
+                if (side != 0) {
+                    container.invalidate((int) Math.floor(box.left + side), (int) Math.floor(box.top + top),
+                            (int) Math.ceil(box.left), (int) Math.ceil(box.bottom - bottom));
+                    container.invalidate((int) Math.floor(box.right), (int) Math.floor(box.top + top),
+                            (int) Math.ceil(box.right - side), (int) Math.ceil(box.bottom - bottom));
+                }
             } catch (Throwable ignored) {
             }
         }
