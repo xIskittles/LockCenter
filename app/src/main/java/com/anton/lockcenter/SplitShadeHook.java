@@ -44,6 +44,12 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
 
     /** Файл с диагностикой (читается из Termux без логов). */
     private static File logFile;
+    /** Контекст SystemUI (появляется уже после загрузки модуля). */
+    private static volatile Context appContext;
+    /** Уже включённые методы (общий набор для всех путей). */
+    private static final Set<String> HOOKED = new LinkedHashSet<>();
+    /** Строки до открытия файла. */
+    private static final java.util.List<String> BUFFERED = new java.util.ArrayList<>();
     private static final String[] MARKER_PATHS = {
             "/data/user_de/0/com.android.systemui/lockcenter_split_shade",
             "/data/data/com.android.systemui/lockcenter_split_shade",
@@ -91,8 +97,8 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
         if (!"com.android.systemui".equals(lpparam.packageName)) return;
         final ClassLoader cl = lpparam.classLoader;
 
-        final Context app = currentApplication(cl);
-        initLogFile(app);
+        appContext = currentApplication(cl);
+        initLogFile(appContext);
         final boolean marker = markerExists();
         log("хук запущен в SystemUI: маркер=" + marker + ", файл=" + logFile);
         if (!marker) {
@@ -102,9 +108,8 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
         log("маркер найден — форсирую раздельную шторку");
 
         // 1) быстрые хуки по известным именам (успевают до инициализации SystemUI)
-        Set<String> hooked = new LinkedHashSet<>();
         for (int i = 0; i < CANDIDATE_CLASSES.length; i++) {
-            forceTrue(cl, CANDIDATE_CLASSES[i], hooked);
+            forceTrue(cl, CANDIDATE_CLASSES[i], HOOKED);
         }
 
         // 2) разбор dex-ов SystemUI и хуки по фактическим именам классов —
@@ -112,8 +117,19 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
+                for (int i = 0; i < 60 && appContext == null; i++) {
+                    try {
+                        Thread.sleep(500L);
+                    } catch (Throwable ignored) {
+                    }
+                    appContext = currentApplication(cl);
+                }
+                initLogFile(appContext);
+                if (appContext == null) {
+                    log("контекст SystemUI не появился — файл диагностики не создан");
+                }
                 try {
-                    discoverAndHook(cl, app, hooked);
+                    discoverAndHook(cl, appContext, HOOKED);
                 } catch (Throwable e) {
                     log("разбор dex: " + e);
                 }
@@ -121,7 +137,37 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
         }, "LockCenter-ShadeScan");
         t.setPriority(Thread.MIN_PRIORITY);
         t.start();
-    }
+
+        // Контекст на этапе загрузки модуля обычно ещё не создан, поэтому ловим
+        // создание SystemUIService: оттуда получаем контекст и открываем файл.
+        try {
+            Class<?> svc = XposedHelpers.findClassIfExists("com.android.systemui.SystemUIService", cl);
+            if (svc != null) {
+                XposedBridge.hookAllMethods(svc, "onCreate", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            Object self = param.thisObject;
+                            if (self instanceof Context) {
+                                appContext = (Context) self;
+                                initLogFile(appContext);
+                                log("контекст получен (SystemUIService), файл=" + logFile);
+                            }
+                        } catch (Throwable e) {
+                            try {
+                                XposedBridge.log(TAG + "SystemUIService hook: " + e);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                });
+                log("жду создания SystemUIService для получения контекста");
+            } else {
+                log("класс SystemUIService не найден");
+            }
+        } catch (Throwable e) {
+            log("хук SystemUIService: " + e);
+        }    }
 
     // ------------------------------------------------------------------ хуки по имени
 
@@ -362,8 +408,17 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + msg);
         } catch (Throwable ignored) {
         }
+        if (logFile == null) {
+            synchronized (BUFFERED) {
+                if (BUFFERED.size() < 400) BUFFERED.add(msg);
+            }
+            return;
+        }
+        writeLine(msg);
+    }
+
+    private static void writeLine(String msg) {
         try {
-            if (logFile == null) return;
             java.io.FileWriter w = new java.io.FileWriter(logFile, true);
             w.write(msg + "\n");
             w.close();
@@ -371,8 +426,20 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
         }
     }
 
+    private static void flushBuffered() {
+        java.util.List<String> copy;
+        synchronized (BUFFERED) {
+            copy = new java.util.ArrayList<>(BUFFERED);
+            BUFFERED.clear();
+        }
+        for (int i = 0; i < copy.size(); i++) {
+            writeLine(copy.get(i));
+        }
+    }
+
     /** Файл диагностики; перезаписывается при каждом старте SystemUI. */
     private static void initLogFile(Context app) {
+        if (logFile != null || app == null) return;
         java.util.List<File> candidates = new java.util.ArrayList<>();
         try {
             if (app != null) candidates.add(new File(app.getFilesDir(), "lockcenter_shade.txt"));
@@ -393,6 +460,7 @@ public class SplitShadeHook implements IXposedHookLoadPackage {
                 w.write("=== LockCenter: раздельная шторка, " + new java.util.Date() + " ===\n");
                 w.close();
                 logFile = f;
+                flushBuffered();
                 try {
                     XposedBridge.log(TAG + "диагностика пишется в " + f);
                 } catch (Throwable ignored) {
